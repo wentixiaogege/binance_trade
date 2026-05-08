@@ -1,0 +1,30 @@
+{
+  "strategy_name": "GhostAdvancedStrategy",
+  "params": {
+    "roi": {
+      "0": 100
+    },
+    "stoploss": {
+      "stoploss": -0.005
+    },
+    "trailing": {
+      "trailing_stop": false,
+      "trailing_stop_positive": null,
+      "trailing_stop_positive_offset": 0.0,
+      "trailing_only_offset_is_reached": false
+    },
+    "max_open_trades": {
+      "max_open_trades": 3
+    },
+    "buy": {
+      "buy_bb_pos": 0.998,
+      "buy_rsi": 73
+    },
+    "sell": {
+      "max_hold": 44,
+      "sell_tp": 0.102
+    }
+  },
+  "ft_stratparam_v": 1,
+  "export_time": "2026-03-24 15:25:03.744507+00:00"
+}

@@ -1,0 +1,34 @@
+# Data files (large)
+user_data/data/
+*.feather
+
+# Backtest results
+user_data/backtest_results/*.zip
+user_data/backtest_results/*.json
+
+# Logs
+*.log
+user_data/logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Temp
+/tmp/
+*.tmp
+
+# Sensitive
+config.json
+config_future.json
+.env
