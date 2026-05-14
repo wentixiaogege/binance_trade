@@ -1,5 +1,6 @@
-# strategy_adx_momentum_optimized.py
-# ADX Momentum Strategy v2 — 简化趋势跟随 + 1h ATR动态止损
+# strategy_bone_blade_optimized.py
+# BoneBlade Strategy v2 — 简化入场 + 1h ATR动态止损
+# 核心：布林带超卖反弹 + 趋势确认 + ATR止损
 
 from freqtrade.strategy.interface import IStrategy
 from pandas import DataFrame
@@ -11,21 +12,23 @@ from datetime import datetime
 import numpy as np
 from freqtrade.strategy import merge_informative_pair
 
-class ADXMomentumStrategy(IStrategy):
+class BoneBladeOptimizedStrategy(IStrategy):
     """
-    ADX Momentum Strategy v2
-    ADX趋势强度 + DMI方向 + EMA趋势 + RSI过滤 + 1h ATR动态止损
+    BoneBlade Strategy v2
+    布林带超卖反弹 + EMA趋势 + ADX强度 + 1h ATR动态止损
     """
 
     WHITELIST = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
                  'DOGE/USDT', 'ADA/USDT', 'TRX/USDT', 'AVAX/USDT', 'LINK/USDT']
 
     buy_params = {
-        "ema_short": 20,
-        "ema_long": 50,
-        "adx_threshold": 22,
-        "rsi_floor": 35,
-        "rsi_ceiling": 70,
+        "bb_period": 20,
+        "bb_std": 2.0,
+        "rsi_floor": 30,
+        "rsi_ceiling": 50,
+        "ema_period": 50,
+        "adx_threshold": 18,
+        "volume_factor": 1.2,
         "atr_period": 14,
         "atr_sl_multiplier": 3.0,
         "informative_timeframe": "1h",
@@ -57,28 +60,37 @@ class ADXMomentumStrategy(IStrategy):
         return [(pair, self.buy_params['informative_timeframe']) for pair in pairs]
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # 1h informative
         informative = self.dp.get_pair_dataframe(pair=metadata['pair'], timeframe=self.buy_params['informative_timeframe'])
         informative['atr_1h'] = ta.ATR(informative, timeperiod=self.buy_params['atr_period'])
 
         dataframe = merge_informative_pair(dataframe, informative, self.timeframe, self.buy_params['informative_timeframe'], ffill=True)
 
-        dataframe['ema_short'] = ta.EMA(dataframe, timeperiod=self.buy_params['ema_short'])
-        dataframe['ema_long'] = ta.EMA(dataframe, timeperiod=self.buy_params['ema_long'])
+        # 5m indicators
+        bollinger = ta.BBANDS(dataframe, timeperiod=self.buy_params['bb_period'],
+                              nbdevup=self.buy_params['bb_std'], nbdevdn=self.buy_params['bb_std'])
+        dataframe['bb_upper'] = bollinger['upperband']
+        dataframe['bb_middle'] = bollinger['middleband']
+        dataframe['bb_lower'] = bollinger['lowerband']
+        dataframe['bb_position'] = (dataframe['close'] - dataframe['bb_lower']) / (dataframe['bb_upper'] - dataframe['bb_lower'] + 1e-10)
+
+        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
+        dataframe['ema'] = ta.EMA(dataframe, timeperiod=self.buy_params['ema_period'])
         dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
         dataframe['plus_di'] = ta.PLUS_DI(dataframe, timeperiod=14)
         dataframe['minus_di'] = ta.MINUS_DI(dataframe, timeperiod=14)
-        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
+        dataframe['volume_ma'] = ta.SMA(dataframe['volume'], timeperiod=20)
+        dataframe['volume_spike'] = dataframe['volume'] > (dataframe['volume_ma'] * self.buy_params['volume_factor'])
 
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         conditions = [
-            dataframe['ema_short'] > dataframe['ema_long'],
-            dataframe['close'] > dataframe['ema_short'],
+            dataframe['close'] > dataframe['bb_middle'],
             dataframe['adx'] > self.buy_params['adx_threshold'],
             dataframe['plus_di'] > dataframe['minus_di'],
-            dataframe['rsi'] > self.buy_params['rsi_floor'],
-            dataframe['rsi'] < self.buy_params['rsi_ceiling'],
+            dataframe['rsi'] > 35,
+            dataframe['rsi'] < 70,
         ]
         dataframe.loc[reduce(lambda x, y: x & y, conditions), 'enter_long'] = 1
         return dataframe
@@ -88,12 +100,15 @@ class ADXMomentumStrategy(IStrategy):
 
     def custom_stoploss(self, pair: str, trade: 'Trade', current_time: datetime,
                         current_rate: float, current_profit: float, **kwargs) -> float:
+        """ATR动态止损 — 与Ghost v3相同的逻辑"""
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if len(dataframe) == 0:
             return self.stoploss
 
         last_candle = dataframe.iloc[-1].squeeze()
         atr = last_candle.get('atr_1h', 0)
+        if atr <= 0:
+            atr = last_candle.get('atr', 0)
         if atr <= 0:
             return self.stoploss
 
@@ -128,7 +143,7 @@ class ADXMomentumStrategy(IStrategy):
             risk_factor *= 0.7
 
         rsi = last_candle.get('rsi', 50)
-        if 40 < rsi < 60:
+        if rsi < 30:
             risk_factor *= 1.2
 
         risk_factor = max(0.3, min(1.5, risk_factor))
