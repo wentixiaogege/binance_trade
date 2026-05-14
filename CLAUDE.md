@@ -95,3 +95,17 @@ freqtrade download-data --config <config> --timerange <范围> --timeframes <周
 - 模式: 合约模拟盘，10 USDT/笔，最大 5 个持仓
 - 交易对: BTC, ETH, BNB, SOL, XRP, DOGE, ADA, TRX, AVAX, LINK (USDT本位)
 - 日志: `/tmp/freqtrade_dryrun.log`
+
+## 部署铁律
+
+1. **任何时候更新策略，必须同步到本地 8081 和云端服务器**
+   - 本地: `kill $(lsof -ti :8081) && nohup freqtrade trade ...`
+   - 云端: `scp 策略文件 → systemctl restart freqtrade`
+2. **同步后必须校验 MD5 一致**
+   - `md5 -q 本地文件` vs `md5sum 云端文件`
+3. **回测通过才能部署** — 永远不在未验证的策略上跑实盘
+4. **部署后检查 API** — `curl localhost:8081/api/v1/profit` 确认运行
+5. **云端地址**: 43.131.249.77:8081 (freqtrade/freqtrade123)
+6. **本地地址**: localhost:8081 (freqtrade/freqtrade123)
+7. **重置模拟盘**: 删除 `tradesv3.dryrun.sqlite` + 设置 `dry_run_wallet=100`
+8. **云端必须上传所有依赖**: `chanlun.py` + `chanlun_adapter.py` + `Strategy003FuturesTop10.py` + `Strategy003.py`
