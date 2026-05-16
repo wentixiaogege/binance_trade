@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Optional
 import numpy as np
+import pandas as pd
 import talib.abstract as ta
 from pandas import DataFrame
 from Strategy003 import Strategy003
@@ -37,7 +38,12 @@ class StrategyChanlunFutures(Strategy003):
         parent.loc[dataframe['ema50'] <= dataframe['ema100'], 'enter_long'] = 0; parent.loc[ev, 'enter_long'] = 0
         parent['enter_short'] = 0; parent.loc[dataframe.get('chan_sell', False), 'enter_short'] = 1
         parent.loc[dataframe['ema50'] >= dataframe['ema100'], 'enter_short'] = 0; parent.loc[ev, 'enter_short'] = 0
-        parent['enter_tag'] = 'chan_top'
+        # Level-based tag: L2+ pivots = higher confidence
+        pivot_lv = dataframe.get('chan_pivot_level', 1)
+        parent['enter_tag'] = 'chan_top'  # default
+        has_entry = (parent['enter_long'] == 1) | (parent['enter_short'] == 1)
+        parent.loc[(pivot_lv >= 2) & has_entry, 'enter_tag'] = 'chan_top'
+        parent.loc[(pivot_lv < 2) & has_entry, 'enter_tag'] = 'chan_high'
         return parent
 
     def populate_exit_trend(self, dataframe, metadata):

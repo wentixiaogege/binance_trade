@@ -108,4 +108,6 @@ freqtrade download-data --config <config> --timerange <范围> --timeframes <周
 5. **云端地址**: 43.131.249.77:8081 (freqtrade/freqtrade123)
 6. **本地地址**: localhost:8081 (freqtrade/freqtrade123)
 7. **重置模拟盘**: 删除 `tradesv3.dryrun.sqlite` + 设置 `dry_run_wallet=100`
-8. **云端必须上传所有依赖**: `chanlun.py` + `chanlun_adapter.py` + `Strategy003FuturesTop10.py` + `Strategy003.py`
+  8. **多bot必须独立数据库**: 每个bot实例必须配置独立的 `db_url`，避免共用同一个sqlite数据库导致订单数据混淆。在配置文件中添加: `"db_url": "sqlite:///tradesv3.dryrun_<策略名>.sqlite"`
+  9. **云端必须上传所有依赖**: `chanlun.py` + `chanlun_adapter.py` + `Strategy003FuturesTop10.py` + `Strategy003.py`
+  10. **服务器地址**：43.131.249.77 密码：kissmyass 账号root

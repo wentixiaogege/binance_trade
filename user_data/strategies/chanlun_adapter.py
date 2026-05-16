@@ -15,10 +15,11 @@ import chanlun as _cl
 class ChanLunSignals:
     """Run full chanlun.py pipeline and extract buy/sell signals."""
 
-    def __init__(self):
+    def __init__(self, max_bars: int = 0):
         self.pivots = []
         self.tails = None
         self.df1 = None
+        self.max_bars = max_bars  # 0 = use all data, N = use last N bars
 
     def analyze(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         """Run pipeline, return dataframe with signal columns appended."""
@@ -26,14 +27,22 @@ class ChanLunSignals:
         n = len(df)
 
         for col in ['chan_buy', 'chan_sell', 'chan_pivot_zg',
-                     'chan_pivot_zd', 'chan_pivot_mid']:
+                     'chan_pivot_zd', 'chan_pivot_mid',
+                     'chan_pivot_level', 'chan_pivot_trend']:
             df[col] = np.nan if 'pivot' in col else False
 
         if n < 200:
             return df
 
+        # Rolling window: use only recent bars for pivot detection
+        if self.max_bars > 0 and n > self.max_bars:
+            work_df = df.iloc[-self.max_bars:].copy()
+            # Need to reset datetime for the adapter's internal processing
+        else:
+            work_df = df
+
         # Step 1-2: Inclusion removal + df1
-        self._build_df1(df)
+        self._build_df1(work_df)
         if self.df1 is None or len(self.df1) <= 60:
             return df
 
@@ -46,7 +55,7 @@ class ChanLunSignals:
         if not self.pivots:
             return df
 
-        # Step 7: Map pivots to original dataframe
+        # Step 7: Map pivots to original dataframe (adjust timestamps for rolling window)
         df = self._map_pivots(df)
 
         # Step 8: Detect boundary break signals
@@ -250,12 +259,19 @@ class ChanLunSignals:
 
             for i in range(si, len(df)):
                 low_i = df['low'].iloc[i]; high_i = df['high'].iloc[i]
-                # Buy: confirmed break below zd (0.3%+ penetration)
                 if p_idx not in triggered_buy and p.enter_d == -1 and low_i < p.zd * 0.997:
                     df.loc[df.index[i], 'chan_buy'] = True; triggered_buy.add(p_idx)
-                # Sell: confirmed break above zg (0.3%+ penetration)
                 if p_idx not in triggered_sell and p.enter_d == 1 and high_i > p.zg * 1.003:
                     df.loc[df.index[i], 'chan_sell'] = True; triggered_sell.add(p_idx)
                 if p_idx in triggered_buy and p_idx in triggered_sell: break
 
+        # Expose pivot trend and level
+        if self.pivots:
+            last = self.pivots[-1]
+            t_start = pd.Timestamp(last.start_time)
+            mask = df_dates >= t_start
+            if mask.any():
+                idx = mask.argmax()
+                df.loc[df.index[idx]:, 'chan_pivot_level'] = getattr(last, 'level', 1)
+                df.loc[df.index[idx]:, 'chan_pivot_trend'] = getattr(last, 'trend', 0)
         return df

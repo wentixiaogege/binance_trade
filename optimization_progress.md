@@ -65,4 +65,34 @@
 
 ---
 
+## 策略目录整理（2026-05-16）
+
+根目录保留正在优化的策略和核心文件，其余按类型归档到子目录：
+
+```
+strategies/
+├── AthenaStrategyV1.py      ← 优化中
+├── BoneBladeStrategyV1.py   ← 优化中
+├── GhostStrategyV1.py       ← 优化中
+├── WhaleStrategyV1.py       ← 优化中
+├── StrategyChanlunFutures.py ← 运行中
+├── Strategy001-005.py       ← 基础策略
+├── chanlun_adapter.py       ← 依赖
+├── sample_strategy.py       ← 模板
+├── trend/                   ← 趋势/ADX/突破 (14 files)
+├── grid/                    ← 网格/剥头皮 (4 files)
+├── mean_reversion/          ← 均值回归 (3 files)
+├── ichimoku/                ← 一目均衡 (3 files)
+├── complex/                 ← 复合指标策略 (8 files)
+├── risk/                    ← 止损/风控实验 (3 files)
+├── experimental/            ← 其他实验策略 (9 files)
+├── berlinguyinca/           ← 社区策略集 (30 files)
+├── deepseek/                ← AI生成实验 (6 files)
+├── futures/                 ← 合约专用 (8 files)
+├── lookahead_bias/          ← 有未来函数偏差 (4 files)
+└── mystrategy/              ← 自定义策略副本 (7 files)
+```
+
+---
+
 **更新时间**：2026-05-15
