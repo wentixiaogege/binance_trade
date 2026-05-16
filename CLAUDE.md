@@ -111,3 +111,4 @@ freqtrade download-data --config <config> --timerange <范围> --timeframes <周
   8. **多bot必须独立数据库**: 每个bot实例必须配置独立的 `db_url`，避免共用同一个sqlite数据库导致订单数据混淆。在配置文件中添加: `"db_url": "sqlite:///tradesv3.dryrun_<策略名>.sqlite"`
   9. **云端必须上传所有依赖**: `chanlun.py` + `chanlun_adapter.py` + `Strategy003FuturesTop10.py` + `Strategy003.py`
   10. **服务器地址**：43.131.249.77 密码：kissmyass 账号root
+  11. **优化日志**: 每次优化或部署后，必须在 `optimization_logs/` 目录下写入按日期的 md 文件（如 `2026-05-16.md`），记录改了什么、回测结果、遇到的问题、下次计划
