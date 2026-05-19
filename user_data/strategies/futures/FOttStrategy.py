@@ -5,6 +5,7 @@ from pandas import DataFrame
 import talib.abstract as ta
 import numpy as np
 import freqtrade.vendor.qtpylib.indicators as qtpylib
+from datetime import datetime
 
 
 
@@ -18,12 +19,12 @@ class FOttStrategy(IStrategy):
     # minimal_roi = {"0": 1}
 
     # Stoploss:
-    stoploss = -0.265
+    stoploss = -0.80
 
-    # Trailing stop:
+    # Trailing stop (widened for 3x-30x leverage; freqtrade divides by leverage)
     trailing_stop = True
-    trailing_stop_positive = 0.05
-    trailing_stop_positive_offset = 0.1
+    trailing_stop_positive = 0.15
+    trailing_stop_positive_offset = 0.30
     trailing_only_offset_is_reached = False
 
     timeframe = "1h"
@@ -68,6 +69,38 @@ class FOttStrategy(IStrategy):
         ] = 1
 
         return dataframe
+
+    def leverage(self, pair: str, current_time: datetime, current_rate: float,
+                 proposed_leverage: float, max_leverage: float, entry_tag: str | None,
+                 side: str, **kwargs) -> float:
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if len(dataframe) == 0:
+            return 3.0
+
+        last_candle = dataframe.iloc[-1].squeeze()
+        adx = last_candle.get('adx', 25)
+        ott = last_candle.get('ott', 0)
+        var = last_candle.get('var', 0)
+        close = last_candle.get('close', 0)
+
+        # 基础杠杆 3x
+        base_leverage = 3.0
+
+        # OTT趋势强劲且ADX高时大幅提升杠杆
+        if adx > 40 and close > ott * 1.02 and var > ott:
+            base_leverage = 30.0
+        elif adx > 35 and close > ott and var > ott * 0.98:
+            base_leverage = 20.0
+        elif adx > 30 and 0.95 * ott < var < 1.05 * ott:
+            base_leverage = 15.0
+        elif adx > 25:
+            base_leverage = 10.0
+
+        # 趋势反转或ADX过低时降低杠杆
+        if adx < 20 or close < ott * 0.98:
+            base_leverage = max(3.0, base_leverage * 0.5)
+
+        return min(base_leverage, max_leverage)
 
     """
         Supertrend Indicator; adapted for freqtrade

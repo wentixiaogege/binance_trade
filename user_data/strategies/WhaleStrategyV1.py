@@ -1,4 +1,5 @@
 # Whale Strategy V1 — OBV资金流 + EMA趋势 + ADX/DMI + 1h ATR止损
+# v1.1: + dynamic leverage (1x-3x based on ADX)
 from freqtrade.strategy.interface import IStrategy
 from pandas import DataFrame
 import talib.abstract as ta
@@ -9,6 +10,7 @@ from functools import reduce
 from datetime import datetime
 import numpy as np
 from freqtrade.strategy import merge_informative_pair
+from freqtrade.persistence import Trade
 
 class WhaleStrategyV1(IStrategy):
 
@@ -21,8 +23,8 @@ class WhaleStrategyV1(IStrategy):
         "informative_timeframe": "1h",
     }
 
-    minimal_roi = {"0": 0.10, "60": 0.06, "120": 0.04, "240": 0.02, "480": 0}
-    stoploss = -0.08
+    minimal_roi = {"0": 1.0}
+    stoploss = -0.80
     timeframe = '5m'
     startup_candle_count = 200
     process_only_new_candles = False
@@ -66,7 +68,37 @@ class WhaleStrategyV1(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
 
-    def custom_stoploss(self, pair: str, trade: 'Trade', current_time: datetime,
+    def leverage(self, pair: str, current_time: datetime, current_rate: float,
+                 proposed_leverage: float, max_leverage: float, entry_tag: str | None,
+                 side: str, **kwargs) -> float:
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if len(dataframe) == 0:
+            return 3.0
+        adx = dataframe.iloc[-1].squeeze().get('adx', 20)
+        obv_ma_short = dataframe.iloc[-1].squeeze().get('obv_ma_short', 0)
+        obv_ma_long = dataframe.iloc[-1].squeeze().get('obv_ma_long', 0)
+        volume_spike = dataframe.iloc[-1].squeeze().get('volume_spike', False)
+
+        # 基础杠杆 3x，根据市场强度动态调整
+        base_leverage = 3.0
+
+        # 趋势强劲时增加杠杆
+        if adx > 35 and volume_spike:
+            base_leverage = 15.0
+        elif adx > 30 and obv_ma_short > obv_ma_long:
+            base_leverage = 10.0
+        elif adx > 25:
+            base_leverage = 8.0
+        elif adx > 20:
+            base_leverage = 5.0
+
+        # 趋势反转或弱势时降低杠杆
+        if adx < 15 or obv_ma_short < obv_ma_long:
+            base_leverage = max(3.0, base_leverage * 0.5)
+
+        return min(base_leverage, max_leverage)
+
+    def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
                         current_rate: float, current_profit: float, **kwargs) -> float:
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if len(dataframe) == 0:
@@ -75,18 +107,19 @@ class WhaleStrategyV1(IStrategy):
         atr = last_candle.get('atr_1h', 0)
         if atr <= 0:
             return self.stoploss
+        lev = trade.leverage or 1.0
         sl_mult = self.buy_params['atr_sl_multiplier']
         if current_profit > 0.10:
             trail_stop = (current_rate - atr * 1.0 - trade.open_rate) / trade.open_rate
-            return max(trail_stop, self.stoploss)
+            return max(trail_stop * lev, self.stoploss * lev)
         elif current_profit > 0.05:
             trail_stop = (current_rate - atr * 2.0 - trade.open_rate) / trade.open_rate
-            return max(trail_stop, self.stoploss)
+            return max(trail_stop * lev, self.stoploss * lev)
         elif current_profit > 0.02:
-            return max(0.005, self.stoploss)
+            return max(0.005 * lev, self.stoploss * lev)
         else:
             base_stop = (current_rate - atr * sl_mult - trade.open_rate) / trade.open_rate
-            return max(base_stop, self.stoploss)
+            return max(base_stop * lev, self.stoploss * lev)
 
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
                             proposed_stake: float, min_stake: float, max_stake: float,

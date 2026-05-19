@@ -1,4 +1,5 @@
 # Athena Strategy V1 — EMA趋势 + MACD + ADX/DMI + HMA回调 + 1h ATR止损
+# v1.1: + dynamic leverage (1x-3x based on ADX)
 from freqtrade.strategy.interface import IStrategy
 from pandas import DataFrame
 import talib.abstract as ta
@@ -8,6 +9,7 @@ from functools import reduce
 from datetime import datetime
 import numpy as np
 from freqtrade.strategy import merge_informative_pair
+from freqtrade.persistence import Trade
 
 class AthenaStrategyV1(IStrategy):
 
@@ -19,8 +21,8 @@ class AthenaStrategyV1(IStrategy):
         "informative_timeframe": "1h",
     }
 
-    minimal_roi = {"0": 0.10, "60": 0.06, "120": 0.04, "240": 0.02, "480": 0}
-    stoploss = -0.08
+    minimal_roi = {"0": 1.0}
+    stoploss = -0.80
     timeframe = '5m'
     startup_candle_count = 200
     process_only_new_candles = False
@@ -64,7 +66,41 @@ class AthenaStrategyV1(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
 
-    def custom_stoploss(self, pair: str, trade: 'Trade', current_time: datetime,
+    def leverage(self, pair: str, current_time: datetime, current_rate: float,
+                 proposed_leverage: float, max_leverage: float, entry_tag: str | None,
+                 side: str, **kwargs) -> float:
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if len(dataframe) == 0:
+            return 3.0
+
+        last_candle = dataframe.iloc[-1].squeeze()
+        adx = last_candle.get('adx', 20)
+        rsi = last_candle.get('rsi', 50)
+        ema_short = last_candle.get('ema_short', 0)
+        ema_long = last_candle.get('ema_long', 0)
+        volume = last_candle.get('volume', 0)
+        volume_ma = last_candle.get('volume_ma', 1)
+
+        # 基础杠杆 3x
+        base_leverage = 3.0
+
+        # 趋势强劲且RSI健康时大幅提升杠杆
+        if adx > 35 and 40 < rsi < 60 and volume > volume_ma * 1.2:
+            base_leverage = 20.0
+        elif adx > 30 and ema_short > ema_long * 1.02 and volume > volume_ma:
+            base_leverage = 15.0
+        elif adx > 25 and rsi > 45:
+            base_leverage = 10.0
+        elif adx > 20:
+            base_leverage = 8.0
+
+        # 超买或趋势弱势时降低杠杆
+        if rsi > 80 or adx < 15 or ema_short < ema_long:
+            base_leverage = max(3.0, base_leverage * 0.6)
+
+        return min(base_leverage, max_leverage)
+
+    def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
                         current_rate: float, current_profit: float, **kwargs) -> float:
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if len(dataframe) == 0:
@@ -73,18 +109,19 @@ class AthenaStrategyV1(IStrategy):
         atr = last_candle.get('atr_1h', 0)
         if atr <= 0:
             return self.stoploss
-        multiplier = self.buy_params['atr_stop_multiplier']
+        lev = trade.leverage or 1.0
+        multiplier = self.buy_params['atr_sl_multiplier']
         if current_profit > 0.10:
             trail_stop = (current_rate - atr * 1.5 - trade.open_rate) / trade.open_rate
-            return max(trail_stop, self.stoploss)
+            return max(trail_stop * lev, self.stoploss * lev)
         elif current_profit > 0.05:
             trail_stop = (current_rate - atr * 2.0 - trade.open_rate) / trade.open_rate
-            return max(trail_stop, self.stoploss)
+            return max(trail_stop * lev, self.stoploss * lev)
         elif current_profit > 0.02:
-            return max(0.005, self.stoploss)
+            return max(0.005 * lev, self.stoploss * lev)
         else:
             base_stop = (current_rate - atr * multiplier - trade.open_rate) / trade.open_rate
-            return max(base_stop, self.stoploss)
+            return max(base_stop * lev, self.stoploss * lev)
 
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
                             proposed_stake: float, min_stake: float, max_stake: float,
