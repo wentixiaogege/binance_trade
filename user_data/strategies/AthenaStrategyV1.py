@@ -51,20 +51,44 @@ class AthenaStrategyV1(IStrategy):
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # 优化：更严格的入场条件，避免ETH等亏损交易
         conditions = [
-            dataframe['ema_short'] > dataframe['ema_long'],
-            dataframe['close'] > dataframe['ema_short'],
-            dataframe['adx'] > self.buy_params['adx_threshold'],
-            dataframe['plus_di'] > dataframe['minus_di'],
-            dataframe['rsi'] > 35,
-            dataframe['rsi'] < 70,
-            dataframe['volume'] > dataframe['volume_ma'],
+            dataframe['ema_short'] > dataframe['ema_long'] * 1.01,  # 更强的EMA趋势
+            dataframe['close'] > dataframe['ema_short'] * 1.02,  # 更强的价格确认
+            dataframe['adx'] > (self.buy_params['adx_threshold'] + 5),  # 提高ADX阈值
+            dataframe['plus_di'] > dataframe['minus_di'] * 1.2,  # 更强的方向性
+            dataframe['rsi'] > 40,  # 提高RSI下限
+            dataframe['rsi'] < 65,  # 降低RSI上限，避免超买
+            dataframe['volume'] > dataframe['volume_ma'] * 1.5,  # 更高的成交量要求
         ]
         dataframe.loc[reduce(lambda x, y: x & y, conditions), 'enter_long'] = 1
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
+
+    def custom_exit(self, pair: str, trade: Trade, current_time: datetime,
+                     current_rate: float, current_profit: float, **kwargs):
+        """
+        动态止盈机制 - 解决AthenaStrategyV1亏损的关键优化
+        """
+        # 如果盈利超过40%，立即止盈50%仓位
+        if current_profit > 0.40:
+            return 'profit_take_50pct'
+
+        # 如果盈利超过25%，止盈30%仓位
+        elif current_profit > 0.25:
+            return 'profit_take_30pct'
+
+        # 如果盈利超过15%，止盈20%仓位
+        elif current_profit > 0.15:
+            return 'profit_take_20pct'
+
+        # 如果盈利超过8%，止盈10%仓位
+        elif current_profit > 0.08:
+            return 'profit_take_10pct'
+
+        return None
 
     def leverage(self, pair: str, current_time: datetime, current_rate: float,
                  proposed_leverage: float, max_leverage: float, entry_tag: str | None,
@@ -81,22 +105,22 @@ class AthenaStrategyV1(IStrategy):
         volume = last_candle.get('volume', 0)
         volume_ma = last_candle.get('volume_ma', 1)
 
-        # 基础杠杆 3x
+        # 基础杠杆 3x，最大限制在15x（从20x降至15x）
         base_leverage = 3.0
 
-        # 趋势强劲且RSI健康时大幅提升杠杆
+        # 趋势强劲且RSI健康时提升杠杆（从20x降至15x）
         if adx > 35 and 40 < rsi < 60 and volume > volume_ma * 1.2:
-            base_leverage = 20.0
+            base_leverage = 15.0  # 从20x降至15x
         elif adx > 30 and ema_short > ema_long * 1.02 and volume > volume_ma:
-            base_leverage = 15.0
+            base_leverage = 12.0  # 从15x降至12x
         elif adx > 25 and rsi > 45:
-            base_leverage = 10.0
+            base_leverage = 8.0   # 从10x降至8x
         elif adx > 20:
-            base_leverage = 8.0
+            base_leverage = 5.0   # 从8x降至5x
 
-        # 超买或趋势弱势时降低杠杆
+        # 超买或趋势弱势时大幅降低杠杆
         if rsi > 80 or adx < 15 or ema_short < ema_long:
-            base_leverage = max(3.0, base_leverage * 0.6)
+            base_leverage = max(3.0, base_leverage * 0.5)
 
         return min(base_leverage, max_leverage)
 
