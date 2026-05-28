@@ -74,6 +74,7 @@
   "db_url": "sqlite:///tradesv3.dryrun_fott.sqlite",
   "bot_name": "fott-dryrun",
   "initial_state": "running",
+  "datadir": "/etc/freqtrade/user_data",
   "force_entry_enable": false,
   "internals": {
     "process_throttle_secs": 8
