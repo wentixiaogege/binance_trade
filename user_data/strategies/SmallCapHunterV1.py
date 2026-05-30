@@ -50,6 +50,11 @@ class SmallCapHunterV1(IStrategy):
     process_only_new_candles = True
     max_open_trades = 5
 
+    # === 马丁DCA加仓 ===
+    position_adjustment_enable = True
+    max_entry_position_adjustment = 2  # 最多加仓2次（共3次入场）
+    dca_step = DecimalParameter(0.02, 0.06, default=0.03, space='buy')  # 每次加仓间距
+
     protections = [
         {"method": "CooldownPeriod", "stop_duration_candles": 4},
         {"method": "StoplossGuard", "lookback_period_candles": 24,
@@ -267,6 +272,7 @@ class SmallCapHunterV1(IStrategy):
         dataframe['volume_ma'] = ta.SMA(dataframe['volume'], timeperiod=20)
         dataframe['volume_spike'] = dataframe['volume'] / dataframe['volume_ma']
         dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
+        dataframe['sma_20'] = ta.SMA(dataframe, timeperiod=20)
 
         # 价格方向蜡烛定义（先定义，后续 exhaustion/pullback/counter 都要用）
         dataframe['bearish_candle'] = (
@@ -470,6 +476,19 @@ class SmallCapHunterV1(IStrategy):
         dataframe.loc[long_counter, 'enter_long'] = 1
         dataframe.loc[long_counter, 'enter_tag'] = 'counter_buy'
 
+        # Type D: DCA加仓（趋势方向上价格回调时持续加仓）
+        # 不要求 adx_ok + vol_ok，比首发信号更宽松，确保加仓窗口持续打开
+        long_dca = (
+            (dataframe['ott_dir_1d'] != -1) &
+            (dataframe['ott_dir_4h'] != -1) &
+            (dataframe['ott_dir_15m'] != -1) &
+            (dataframe['ott_dir'] == 1) &
+            (dataframe['close'] < dataframe['sma_20']) &
+            ~long_flip & ~long_pullback & ~long_counter
+        )
+        dataframe.loc[long_dca, 'enter_long'] = 1
+        dataframe.loc[long_dca, 'enter_tag'] = 'dca_long'
+
         # === 做空条件（分离三种入场类型）===
         short_base = (
             (dataframe['ott_dir_1d'] != 1) &
@@ -495,6 +514,18 @@ class SmallCapHunterV1(IStrategy):
         dataframe.loc[short_counter, 'enter_short'] = 1
         dataframe.loc[short_counter, 'enter_tag'] = 'counter_sell'
 
+        # Type D: DCA加仓（趋势方向上价格反弹时持续加仓）
+        short_dca = (
+            (dataframe['ott_dir_1d'] != 1) &
+            (dataframe['ott_dir_4h'] != 1) &
+            (dataframe['ott_dir_15m'] != 1) &
+            (dataframe['ott_dir'] == -1) &
+            (dataframe['close'] > dataframe['sma_20']) &
+            ~short_flip & ~short_pullback & ~short_counter
+        )
+        dataframe.loc[short_dca, 'enter_short'] = 1
+        dataframe.loc[short_dca, 'enter_tag'] = 'dca_short'
+
         return dataframe
 
     # ========== 出场 ==========
@@ -512,6 +543,24 @@ class SmallCapHunterV1(IStrategy):
         dataframe.loc[tf_4h_flip_bull, 'exit_short'] = 1
 
         return dataframe
+
+    # ========== DCA 马丁加仓 ==========
+    def adjust_entry_price(self, trade, order_type, amount, rate,
+                           time_in_force, side, entry_tag, **kwargs):
+        """
+        趋势方向上加仓: 每次加仓挂单在更好价格
+        做多: 回调时加仓，挂单在当前价下方
+        做空: 反弹时加仓，挂单在当前价上方
+        """
+        step = float(self.dca_step.value)
+        count = trade.nr_of_successful_entries  # 0=初始, 1=第一次加仓, 2=第二次加仓
+
+        if trade.is_short:
+            adjusted = rate * (1 + step * (count + 1))
+        else:
+            adjusted = rate * (1 - step * (count + 1))
+
+        return adjusted
 
     # ========== 杠杆 ==========
     def leverage(self, pair: str, current_time: datetime, current_rate: float,
@@ -542,9 +591,15 @@ class SmallCapHunterV1(IStrategy):
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if len(dataframe) == 0:
             return proposed_stake
+
+        # 检查是否已有持仓（DCA加仓）
+        trade = kwargs.get('trade', None)
+        is_dca = trade is not None and trade.nr_of_successful_entries > 0
+
         last = dataframe.iloc[-1].squeeze()
         atr_ratio = last.get('atr_ratio', 0.03)
         btc_bull = last.get('btc_bullish', 1)
+
         # 波动率越高仓位越小
         if atr_ratio > 0.06:
             stake = proposed_stake * 0.3
@@ -554,9 +609,16 @@ class SmallCapHunterV1(IStrategy):
             stake = proposed_stake * 0.7
         else:
             stake = proposed_stake
+
         # BTC弱势减半
         if not btc_bull:
             stake = stake * 0.5
+
+        # DCA加仓: 越加越大（马丁）
+        if is_dca:
+            dca_mult = 1.5 ** trade.nr_of_successful_entries
+            stake = stake * dca_mult
+
         return max(min_stake, min(stake, max_stake))
 
     # ========== 动态出场 ==========
