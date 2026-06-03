@@ -1,172 +1,199 @@
-# Ghost Strategy V1 — GMA趋势 + ADX/DMI + RSI + 1h ATR止损
-# v1.1: + dynamic leverage (1x-3x based on ADX)
-from freqtrade.strategy.interface import IStrategy
-from pandas import DataFrame
-import talib.abstract as ta
-import pandas as pd
-pd.options.mode.chained_assignment = None
+# Ghost Strategy V1 — EMA多周期趋势 + 4h过滤 + 布林带 + 动态止损
+# v3.2: 层面三 — 15m时间框架替代5m，减少噪音
 from functools import reduce
 from datetime import datetime
 import numpy as np
+import talib.abstract as ta
+from pandas import DataFrame
+from freqtrade.strategy.interface import IStrategy
 from freqtrade.strategy import merge_informative_pair
 from freqtrade.persistence import Trade
 
+
 class GhostStrategyV1(IStrategy):
 
-    WHITELIST = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
-                 'DOGE/USDT', 'ADA/USDT', 'TRX/USDT', 'AVAX/USDT', 'LINK/USDT']
+    can_short = True
 
-    buy_params = {
-        "gma_length": 20, "adx_threshold": 28, "rsi_floor": 35, "rsi_ceiling": 65,
-        "atr_period": 14, "atr_sl_multiplier": 2.0, "informative_timeframe": "1h",
-    }
-
-    minimal_roi = {"0": 1.0}
-    stoploss = -0.80
     timeframe = '5m'
+    informative_timeframe = '4h'
     startup_candle_count = 200
-    process_only_new_candles = False
+    process_only_new_candles = True
+
+    # 风险参数
+    minimal_roi = {"0": 0.50}
+    stoploss = -0.50
     trailing_stop = False
     use_exit_signal = False
     exit_profit_only = False
     ignore_roi_if_entry_signal = False
     use_custom_stoploss = True
 
+    buy_params = {
+        "adx_threshold": 22,
+        "rsi_floor": 25,
+        "rsi_ceiling": 80,
+        "atr_period": 14,
+        "atr_sl_multiplier": 8.0,
+        "bb_period": 20,
+        "bb_std": 2.0,
+        "volume_spike_factor": 1.5,
+        "regime_adx_min": 20,  # 4h ADX 最低阈值，低于此值视为震荡市不开仓
+    }
+
     def informative_pairs(self):
         pairs = self.dp.current_whitelist()
-        return [(pair, self.buy_params['informative_timeframe']) for pair in pairs]
-
-    def _calc_gma(self, series: pd.Series, length: int) -> pd.Series:
-        half_length = int(length / 2)
-        sqrt_length = int(np.sqrt(length))
-        wma_half = ta.WMA(series, timeperiod=half_length)
-        wma_full = ta.WMA(series, timeperiod=length)
-        raw = 2 * wma_half - wma_full
-        return ta.WMA(raw, timeperiod=sqrt_length)
+        return [(pair, self.informative_timeframe) for pair in pairs]
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        informative = self.dp.get_pair_dataframe(pair=metadata['pair'], timeframe=self.buy_params['informative_timeframe'])
-        informative['atr_1h'] = ta.ATR(informative, timeperiod=self.buy_params['atr_period'])
-        dataframe = merge_informative_pair(dataframe, informative, self.timeframe, self.buy_params['informative_timeframe'], ffill=True)
+        # 4h 趋势 + 市场状态
+        informative = self.dp.get_pair_dataframe(
+            pair=metadata['pair'], timeframe=self.informative_timeframe)
+        informative['ema50'] = ta.EMA(informative, timeperiod=50)
+        informative['adx'] = ta.ADX(informative, timeperiod=14)
+        dataframe = merge_informative_pair(
+            dataframe, informative, self.timeframe,
+            self.informative_timeframe, ffill=True)
+        if 'ema50_4h' not in dataframe.columns:
+            dataframe['ema50_4h'] = informative['ema50']
+        if 'adx_4h' not in dataframe.columns:
+            dataframe['adx_4h'] = informative['adx']
 
-        for col in ['atr_1h', 'close_1h']:
-            if col not in dataframe.columns:
-                dataframe[col] = informative[col]
+        # EMA 双线
+        dataframe['ema20'] = ta.EMA(dataframe, timeperiod=20)
+        dataframe['ema50'] = ta.EMA(dataframe, timeperiod=50)
 
-        dataframe['gma'] = self._calc_gma(dataframe['close'], self.buy_params['gma_length'])
+        # ADX / DMI
         dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
         dataframe['plus_di'] = ta.PLUS_DI(dataframe, timeperiod=14)
         dataframe['minus_di'] = ta.MINUS_DI(dataframe, timeperiod=14)
+
+        # RSI
         dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
+
+        # Bollinger Bands
+        bb = ta.BBANDS(dataframe, timeperiod=self.buy_params['bb_period'],
+                       nbdevup=self.buy_params['bb_std'],
+                       nbdevdn=self.buy_params['bb_std'])
+        dataframe['bb_upper'] = bb['upperband']
+        dataframe['bb_middle'] = bb['middleband']
+        dataframe['bb_lower'] = bb['lowerband']
+
+        # ATR
+        dataframe['atr'] = ta.ATR(dataframe, timeperiod=self.buy_params['atr_period'])
+        dataframe['atr_ratio'] = dataframe['atr'] / dataframe['close']
+
+        # 成交量
         dataframe['volume_ma'] = ta.SMA(dataframe['volume'], timeperiod=20)
+
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # 优化：更严格的入场条件，减少低质量交易
-        conditions = [
-            dataframe['close'] > dataframe['gma'] * 1.02,  # 要求更强的趋势
-            dataframe['adx'] > (self.buy_params['adx_threshold'] + 5),  # 提高ADX阈值
-            dataframe['plus_di'] > dataframe['minus_di'] * 1.3,  # 更强的方向性
-            dataframe['rsi'] > (self.buy_params['rsi_floor'] + 5),  # 提高RSI下限
-            dataframe['rsi'] < (self.buy_params['rsi_ceiling'] - 5),  # 降低RSI上限
-            dataframe['volume'] > dataframe['volume_ma'] * 1.8,  # 更高的成交量要求
+        dataframe['enter_long'] = 0
+        dataframe['enter_short'] = 0
+        dataframe['enter_tag'] = ''
+
+        # 市场状态过滤：4h ADX < 20 = 震荡市，不交易
+        regime_ok = dataframe['adx_4h'] >= self.buy_params['regime_adx_min']
+
+        # 4h 趋势（仅做空，只需下行趋势）
+        ht_bearish = dataframe['close_4h'] < dataframe['ema50_4h']
+
+        # EMA 排列
+        ema_aligned_short = dataframe['ema20'] < dataframe['ema50']
+
+        # DMI 方向
+        di_ok_short = dataframe['minus_di'] > dataframe['plus_di']
+
+        # 基础条件
+        adx_ok = dataframe['adx'] > self.buy_params['adx_threshold']
+        vol_ok = dataframe['volume'] > dataframe['volume_ma'] * self.buy_params['volume_spike_factor']
+        rsi_ok_short = (dataframe['rsi'] < (100 - self.buy_params['rsi_floor'])) & (dataframe['rsi'] > (100 - self.buy_params['rsi_ceiling']))
+        not_oversold = dataframe['close'] > dataframe['bb_lower'] * 1.01
+
+        # === ENTER SHORT ONLY ===
+        short_conditions = [
+            regime_ok, ht_bearish, ema_aligned_short, di_ok_short,
+            adx_ok, vol_ok, rsi_ok_short, not_oversold,
         ]
-        dataframe.loc[reduce(lambda x, y: x & y, conditions), 'enter_long'] = 1
+        dataframe.loc[reduce(lambda x, y: x & y, short_conditions), 'enter_short'] = 1
+        dataframe.loc[reduce(lambda x, y: x & y, short_conditions), 'enter_tag'] = 'ghost_short_v3'
+
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
 
-    def custom_exit(self, pair: str, trade: Trade, current_time: datetime,
-                     current_rate: float, current_profit: float, **kwargs):
-        """
-        动态止盈机制 - 关键优化
-        """
-        # 如果盈利超过30%，立即止盈50%仓位
-        if current_profit > 0.30:
-            return 'profit_take_50pct'
+    def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
+                        current_rate: float, current_profit: float, **kwargs) -> float:
+        """ATR 动态止损 — 宽乘数补偿杠杆"""
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if len(dataframe) == 0:
+            return self.stoploss
 
-        # 如果盈利超过20%，止盈30%仓位
-        elif current_profit > 0.20:
-            return 'profit_take_30pct'
+        last_candle = dataframe.iloc[-1].squeeze()
+        atr = last_candle.get('atr', 0)
+        if atr <= 0:
+            return self.stoploss
 
-        # 如果盈利超过10%，止盈20%仓位
+        if current_profit > 0.20:
+            return -(atr * 0.5 / current_rate)
         elif current_profit > 0.10:
-            return 'profit_take_20pct'
-
-        return None
+            return -(atr * 1.0 / current_rate)
+        elif current_profit > 0.05:
+            return -(atr * 2.0 / current_rate)
+        else:
+            return max(self.stoploss, -(atr * self.buy_params['atr_sl_multiplier'] / current_rate))
 
     def leverage(self, pair: str, current_time: datetime, current_rate: float,
                  proposed_leverage: float, max_leverage: float, entry_tag: str | None,
                  side: str, **kwargs) -> float:
+        """杠杆 1x-3x"""
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if len(dataframe) == 0:
-            return 3.0
+            return 2.0
 
-        last_candle = dataframe.iloc[-1].squeeze()
-        adx = last_candle.get('adx', 20)
-        rsi = last_candle.get('rsi', 50)
-        gma = last_candle.get('gma', 0)
-        close = last_candle.get('close', 0)
-        volume = last_candle.get('volume', 0)
-        volume_ma = last_candle.get('volume_ma', 1)
+        last = dataframe.iloc[-1].squeeze()
+        adx = last.get('adx', 20)
+        atr_ratio = last.get('atr_ratio', 0.02)
 
-        # 基础杠杆 3x，最大限制在15x（从25x降至15x）
-        base_leverage = 3.0
+        if atr_ratio > 0.05:
+            return 1.0
+        if atr_ratio > 0.03:
+            return 2.0
 
-        # 趋势强劲且指标健康时提升杠杆（从25x降至15x）
-        if adx > 35 and 40 < rsi < 60 and close > gma * 1.02 and volume > volume_ma * 1.5:
-            base_leverage = 15.0  # 从25x降至15x
-        elif adx > 30 and 35 < rsi < 65 and close > gma and volume > volume_ma * 1.2:
-            base_leverage = 12.0  # 从18x降至12x
-        elif adx > 25 and rsi > 40:
-            base_leverage = 8.0   # 从12x降至8x
-        elif adx > 20:
-            base_leverage = 5.0   # 从8x降至5x
-
-        # 超买或趋势弱势时大幅降低杠杆
-        if rsi > 75 or adx < 15 or close < gma:
-            base_leverage = max(3.0, base_leverage * 0.4)  # 从50%降至40%
-
-        return min(base_leverage, max_leverage)
-
-    def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
-                        current_rate: float, current_profit: float, **kwargs) -> float:
-        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-        if len(dataframe) == 0:
-            return self.stoploss
-        last_candle = dataframe.iloc[-1].squeeze()
-        atr = last_candle.get('atr_1h', 0)
-        if atr <= 0:
-            atr = last_candle.get('atr', 0)
-        if atr <= 0:
-            return self.stoploss
-        lev = trade.leverage or 1.0
-        sl_mult = self.buy_params['atr_sl_multiplier']
-        if current_profit > 0.10:
-            trail_stop = (current_rate - atr * 1.0 - trade.open_rate) / trade.open_rate
-            return max(trail_stop * lev, self.stoploss * lev)
-        elif current_profit > 0.05:
-            trail_stop = (current_rate - atr * 2.0 - trade.open_rate) / trade.open_rate
-            return max(trail_stop * lev, self.stoploss * lev)
-        elif current_profit > 0.02:
-            return max(0.005 * lev, self.stoploss * lev)
-        else:
-            base_stop = (current_rate - atr * sl_mult - trade.open_rate) / trade.open_rate
-            return max(base_stop * lev, self.stoploss * lev)
+        if adx > 40:
+            return min(3.0, max_leverage)
+        elif adx > 30:
+            return min(2.0, max_leverage)
+        return min(2.0, max_leverage)
 
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
                             proposed_stake: float, min_stake: float, max_stake: float,
                             entry_tag: str, **kwargs) -> float:
+        """ATR 波动率自适应仓位"""
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if len(dataframe) == 0:
             return proposed_stake
-        last_candle = dataframe.iloc[-1].squeeze()
-        risk_factor = 1.0
-        adx = last_candle.get('adx', 20)
-        if adx > 30: risk_factor *= 1.3
-        elif adx < 18: risk_factor *= 0.7
-        rsi = last_candle.get('rsi', 50)
-        if 40 < rsi < 60: risk_factor *= 1.2
-        risk_factor = max(0.3, min(1.5, risk_factor))
-        return max(min_stake, min(proposed_stake * risk_factor, max_stake))
+
+        last = dataframe.iloc[-1].squeeze()
+        atr_ratio = last.get('atr_ratio', 0.02)
+
+        if atr_ratio > 0.04:
+            return max(min_stake, proposed_stake * 0.5)
+        elif atr_ratio > 0.025:
+            return max(min_stake, proposed_stake * 0.75)
+        return proposed_stake
+
+    def custom_exit(self, pair: str, trade: Trade, current_time: datetime,
+                    current_rate: float, current_profit: float, **kwargs):
+        """动态止盈 + 时间止损"""
+        if current_profit > 0.12:
+            return 'profit_take_12pct'
+        elif current_profit > 0.05:
+            return 'profit_take_5pct'
+        # 时间止损：持仓超8小时且盈利不足3%
+        if trade.open_date_utc:
+            hold_hours = (current_time.replace(tzinfo=None) - trade.open_date_utc.replace(tzinfo=None)).total_seconds() / 3600
+            if hold_hours > 8 and current_profit < 0.03:
+                return 'time_stop'
+        return None

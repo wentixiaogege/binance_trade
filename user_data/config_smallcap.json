@@ -1,4 +1,5 @@
 {
+  "timezone": "Asia/Shanghai",
   "exchange": {
     "name": "binance",
     "key": "",
@@ -84,12 +85,13 @@
   },
   "trading_mode": "futures",
   "margin_mode": "isolated",
+  "fee": 0.003,
   "stake_currency": "USDT",
   "stake_amount": 20,
   "dry_run": true,
   "initial_state": "running",
   "dry_run_wallet": 100,
-  "max_open_trades": 3,
+  "max_open_trades": 5,
   "timeframe": "3m",
   "datadir": "user_data",
   "db_url": "sqlite:///tradesv3.dryrun_smallcap.sqlite",
@@ -116,6 +118,7 @@
     "use_order_book": true,
     "order_book_top": 1
   },
+  "backtest_slippage": 0.005,
   "unfilledtimeout": {
     "entry": 15,
     "exit": 15,

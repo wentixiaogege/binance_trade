@@ -74,3 +74,85 @@
 | **胜率** | 66.7% | 71.4% | 57.1% | 89.7% | 66.7% | 22.0% |
 | **适用市场** | 震荡+趋势 | 资金流趋势 | 区间突破 | 趋势跟踪 | 趋势跟踪 | 趋势跟踪 |
 | **推荐杠杆** | 50x-100x | 3x-15x | 3x-20x | 3x-30x | 3x-15x | 3x-15x |
+
+---
+
+## 🖥️ 服务器部署状态
+
+> 服务器: `43.131.249.77` (root) | 更新时间: 2026-05-24
+
+### 部署总览
+
+| 端口 | 策略 | 配置文件 | PID | 启动时间 | 数据库 | 状态 |
+|------|------|----------|-----|----------|--------|------|
+| 8081 | StrategyChanlunFutures | config.json | 244746 | May 16 | tradesv3.dryrun.sqlite | ✅ 运行中 |
+| 8082 | AthenaStrategyV1 | config_athena.json | 580606 | May 17 | tradesv3.dryrun_athena.sqlite | ✅ 运行中 |
+| 8083 | BoneBladeStrategyV1 | config_boneblade.json | 581331 | May 17 | tradesv3.dryrun_boneblade.sqlite | ✅ 运行中 |
+| 8084 | GhostStrategyV1 | config_ghost.json | 581445 | May 17 | tradesv3.dryrun_ghost.sqlite | ✅ 运行中 |
+| 8085 | WhaleStrategyV1 | config_whale.json | 581577 | May 17 | tradesv3.dryrun_whale.sqlite | ✅ 运行中 |
+| 8086 | TrendRiderStrategy | config_trendrider.json | 446289 | May 17 | tradesv3.dryrun_trendrider.sqlite | ✅ 运行中 |
+| 8088 | FOttStrategy | config_fott.json | 2917777 | May 24 | tradesv3.dryrun_fott.sqlite | ✅ 运行中 |
+
+### 服务器环境
+
+- **Python 环境**: `/root/freqtrade_env/bin/python3` (v3.12.3)
+- **工作目录**: `/root/freqtrade_bot`
+- **数据目录**: `/root/freqtrade_bot/user_data`
+- **策略路径**: `user_data/strategies`
+- **日志目录**: `/tmp/freqtrade_<策略名>.log`
+- **统一 API 凭据**: `freqtrade` / `freqtrade123`
+
+### 部署命令模板
+
+```bash
+# 1. 同步文件到服务器
+sshpass -p 'kissmyass' scp user_data/strategies/<策略名>.py root@43.131.249.77:/root/freqtrade_bot/user_data/strategies/
+sshpass -p 'kissmyass' scp user_data/config_<策略名>.json root@43.131.249.77:/root/freqtrade_bot/user_data/
+
+# 2. 校验 MD5
+md5 -q user_data/strategies/<策略名>.py
+sshpass -p 'kissmyass' ssh root@43.131.249.77 "md5sum /root/freqtrade_bot/user_data/strategies/<策略名>.py"
+
+# 3. 启动 bot (替换 <端口号> 和 <策略名>)
+sshpass -p 'kissmyass' ssh root@43.131.249.77 "
+  cd /root/freqtrade_bot && \
+  nohup /root/freqtrade_env/bin/freqtrade trade \
+    --config user_data/config_<策略名>.json \
+    --strategy <策略名> \
+    --strategy-path user_data/strategies \
+    > /tmp/freqtrade_<策略名>.log 2>&1 &
+"
+
+# 4. 验证启动
+curl -s -u freqtrade:freqtrade123 http://43.131.249.77:<端口号>/api/v1/status
+```
+
+### 新策略部署 Checklist
+
+- [ ] 策略文件上传到 `/root/freqtrade_bot/user_data/strategies/`
+- [ ] 配置文件上传到 `/root/freqtrade_bot/user_data/`（含独立 `db_url`、端口号、`bot_name`）
+- [ ] MD5 校验本地与服务器文件一致
+- [ ] 端口未被占用（`ss -tlnp | grep <端口>`）
+- [ ] 旧进程已清理（`kill <旧PID>`）
+- [ ] 新 bot 启动成功，API 返回正常
+- [ ] 更新本文档的部署总览表
+
+### 常用管理命令
+
+```bash
+# 查看所有 bot 进程
+ps aux | grep freqtrade | grep -v grep
+
+# 查看端口占用
+ss -tlnp | grep -E '808[0-9]'
+
+# 查看某个 bot 日志
+tail -f /tmp/freqtrade_fott.log
+
+# 停止某个 bot
+kill <PID>
+
+# 查看 API 状态
+curl -s -u freqtrade:freqtrade123 http://localhost:<端口>/api/v1/status
+curl -s -u freqtrade:freqtrade123 http://localhost:<端口>/api/v1/profit
+```
