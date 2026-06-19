@@ -1,0 +1,57 @@
+{
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "ccxt_config": {
+      "enableRateLimit": true,
+      "options": {
+        "defaultType": "swap"
+      }
+    },
+    "pair_whitelist": [
+      "HYPE/USDT:USDT",
+      "ZEC/USDT:USDT",
+      "BEAT/USDT:USDT",
+      "IN/USDT:USDT",
+      "GRASS/USDT:USDT",
+      "XAU/USDT:USDT",
+      "ONDO/USDT:USDT",
+      "TAO/USDT:USDT",
+      "WLD/USDT:USDT",
+      "XAG/USDT:USDT"
+    ],
+    "pair_blacklist": []
+  },
+  "trading_mode": "futures",
+  "margin_mode": "cross",
+  "stake_currency": "USDT",
+  "stake_amount": 20,
+  "dry_run": true,
+  "dry_run_wallet": 100,
+  "max_open_trades": 5,
+  "timeframe": "3m",
+  "datadir": "user_data",
+  "bot_name": "smallcap",
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "entry_pricing": {
+    "price_side": "same",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "exit_pricing": {
+    "price_side": "same",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "unfilledtimeout": {
+    "entry": 15,
+    "exit": 15,
+    "exit_timeout_count": 0,
+    "unit": "minutes"
+  }
+}

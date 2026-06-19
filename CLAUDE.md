@@ -3,6 +3,12 @@
 > **任何时候涉及策略开发、优化、回测、部署，必须首先参考 [[策略优化必知.md]] 中的规范。**
 > 该文档提炼自 freqtrade-tutorials-main 全部英文教程，是所有策略工作的铁律。
 
+## 🚫 强制规则
+
+1. **用户提问/要求解释时，只分析不修改。** 禁止在讨论阶段改代码或部署服务器。
+2. **只有用户明确说"改"、"修"、"部署"时，才动手。**
+3. **修改策略前必须先备份当前版本。**
+
 ## 项目概述
 
 基于 [freqtrade](https://www.freqtrade.io/) 的加密货币自动化交易机器人，在 Binance 上进行现货和合约交易。项目目标是"先稳定跑起来，再逐步优化"。
@@ -89,6 +95,17 @@ sshpass -p 'kissmyass' ssh root@43.131.249.77 "tail -f /tmp/freqtrade_<策略名
 
 ### 回测（本地 CLI + FreqUI 多周期可视化）
 
+> ⚠️ **滚动窗口回测铁律**：任何使用有状态/自适应指标（如缠论 BSP、动态阈值等）的策略，
+> 必须在回测中模拟实盘的滚动窗口行为。禁止一次性传入全部历史数据计算指标，
+> 否则回测结果包含 look-ahead bias，与实盘完全不可比。
+>
+> **标准做法**：`process_only_new_candles = False` + 策略内部维护滚动缓存，
+> 首次仅用 `startup_candle_count` 根 K 线，之后每次调用只新增 1 根。
+> 参考 `StrategyChanPy.py` 的 `_klu_cache` + `_cache_call_count` 实现。
+>
+> **验证**：同一个 timerange，滚动模式与全量模式结果差距应在预期范围内。
+> 如果差距巨大（如 87 trades → 1 trade），说明指标有严重 look-ahead bias，需要修复。
+
 **每次回测必须遵循此流程，确保能在 FreqUI 中查看多周期图表。**
 
 ```bash
@@ -137,7 +154,7 @@ cp -r dist/* "$INSTALLED"/
 # 重启 webserver 生效
 ```
 
-## 当前运行（2026-05-24）
+## 当前运行（2026-06-17）
 
 **所有策略均运行在云端服务器，本地不再运行 bot。** 本地仅用于回测和开发。
 
@@ -149,16 +166,17 @@ cp -r dist/* "$INSTALLED"/
 
 | 端口 | 策略 | bot_name | PID | 启动时间 | 数据库 | 状态 |
 |------|------|----------|-----|----------|--------|------|
-| 8081 | StrategyChanlunFutures | Chanlun-8081 | 2919972 | May 24 | tradesv3.dryrun_chanlun.sqlite | ✅ |
-| 8082 | AthenaStrategyV1 | Athena-8082 | 2920176 | May 24 | tradesv3.dryrun_athena.sqlite | ✅ |
-| 8083 | BoneBladeStrategyV1 | BoneBlade-8083 | 2920264 | May 24 | tradesv3.dryrun_boneblade.sqlite | ✅ |
-| 8084 | GhostStrategyV1 | Ghost-8084 | 2975350 | May 24 | tradesv3.dryrun_ghost.sqlite | ✅ v3 (5m) |
-| 8085 | WhaleStrategyV1 | Whale-8085 | 2975707 | May 24 | tradesv3.dryrun_whale.sqlite | ✅ v3 (5m) |
-| 8086 | TrendRiderStrategy | TrendRider-8086 | 2920550 | May 24 | tradesv3.dryrun_trendrider.sqlite | ✅ |
-| 8088 | FOttStrategy2 | FOtt2-8088 | 2997789 | May 24 | tradesv3.dryrun_fott.sqlite | ✅ v2 |
+| 8081 | StrategyChanPy | ChanPy-8081 | 2739926 | Jun 16 21:55 | tradesv3.dryrun_chanpy.sqlite | ✅ |
+| 8087 | SmallCapHunterV1 | SmallCap-8087 | 2535133 | Jun 16 08:10 | tradesv3.dryrun_smallcap.sqlite | ✅ |
 
-- 模式: 合约模拟盘（dry_run），isolated 逐仓，20 USDT/笔，最大 6 个持仓
-- 交易对: BTC, ETH, BNB, SOL, XRP, DOGE, ADA, TRX, AVAX, LINK (USDT本位)
+- **8081 StrategyChanPy**: 合约模拟盘，cross 全仓，20 USDT/笔，最大 15 持仓，5m K线
+  - 交易对: BTC, ETH, BNB, SOL, XRP, DOGE, ADA, TRX, AVAX, LINK (USDT本位)
+  - 杠杆: MTF共识决定 (mtf3=30x, mtf2=20x, mtf1=10x, mtf0=5x)
+  - v2 (Jun 16): 入场逻辑从 `prev_buy` 放宽为 `recent_buy`(6K内BSP即可)，解决 2天0交易问题
+- **8087 SmallCapHunterV1**: 合约模拟盘，cross 全仓，50 USDT/笔，最大 15 持仓，3m K线
+  - 交易对: HYPE, ZEC, BEAT, IN, GRASS, XAU, ONDO, TAO, WLD, XAG (小币种)
+  - 杠杆: MTF共识决定 (3/3=30x, 2/3=20x, 1/3=10x, 0/3=5x)
+  - v3 (Jun 16): 日志洪水修复(仅最新K线打log) + timedelta import修复
 - 每个 bot 均配置独立 `db_url`，数据库隔离
 
 ## 📊 最新策略回测效果（2026-05-21）
@@ -199,13 +217,15 @@ cp -r dist/* "$INSTALLED"/
 2. **同步后必须校验 MD5 一致**
    - `md5 -q 本地文件` vs `ssh root@43.131.249.77 "md5sum 云端文件"`
 3. **回测通过才能部署** — 永远不在未验证的策略上跑实盘
+   - **回测必须用滚动窗口模式**，禁止全量数据一次性计算指标（见回测章节的铁律）
 4. **部署后检查 API** — `curl -s -u freqtrade:freqtrade123 http://43.131.249.77:<端口>/api/v1/profit` 确认运行
-5. **云端地址**: 43.131.249.77:8081-8088 (freqtrade/freqtrade123)
+5. **云端地址**: 43.131.249.77:8081,8087 (freqtrade/freqtrade123)
 6. **本地不再运行 bot** — 仅用于回测和策略开发
 7. **重置模拟盘**: 删除对应 `tradesv3.dryrun_<策略名>.sqlite` + 重启 bot
 8. **多bot必须独立数据库**: 每个bot实例必须配置独立的 `db_url`，避免共用同一个sqlite数据库导致订单数据混淆。在配置文件中添加: `"db_url": "sqlite:///tradesv3.dryrun_<策略名>.sqlite"`
 9. **每个 bot 必须配置 bot_name**: 在配置文件中添加 `"bot_name": "<策略名>-<端口>"`, 方便在 Web UI 中区分
 10. **服务器地址**：43.131.249.77 密码：kissmyass 账号root
+11. **禁止在服务器上回测** — 回测一律在本地进行，服务器仅运行模拟盘/实盘 bot。在服务器跑回测容易 OOM 导致所有 bot 一起挂。本地数据用 `freqtrade download-data` 下载
 11. **优化日志**: 每次优化或部署后，必须在 `optimization_logs/` 目录下写入按日期的 md 文件（如 `2026-05-16.md`），记录改了什么、回测结果、遇到的问题、下次计划
 12. **重启 bot 必须优雅停止**: 
    - 先 `kill <PID>`（SIGTERM），等 5 秒让进程释放 SQLite WAL 锁
@@ -214,6 +234,7 @@ cp -r dist/* "$INSTALLED"/
 13. **数据库锁死急救**: 如果 bot 日志报 `QueuePool limit ... connection timed out`，说明 SQLite WAL 锁残留
    - 删除 `tradesv3.dryrun_<策略名>.sqlite` + `.sqlite-wal` + `.sqlite-shm`
    - 重启该 bot（旧交易记录会丢失）
+14. **禁止并发启动同一配置的 bot**: freqtrade trade 启动时会 spawn 子进程，如果短时间内多次执行同一启动命令，会出现两个进程抢同一个端口，其中后启动的会报 `address already in use` 然后挂起。重启时务必先 `pkill -f 'config_<xxx>.json'` 确保旧进程全死，等 3 秒，再启动新进程。启动后检查 `ps aux | grep freqtrade | grep -v grep | wc -l` 确认进程数 = 预期 bot 数量。
 
 ---
 

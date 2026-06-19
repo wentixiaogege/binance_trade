@@ -1,5 +1,5 @@
 """
-SmallCapHunterV1 — 小币种趋势猎手
+SmallCapHunterV1 — 小币种趋势猎手 (v2: 滚动窗口消除未来信号)
 核心思路: 大周期定方向，小周期找 exhaustion 点入场
 
 多周期分工:
@@ -15,18 +15,24 @@ SmallCapHunterV1 — 小币种趋势猎手
 - 做多: 1d/4h/15m 看涨 + 3m OTT 刚翻多（回调结束入场）
 - 做空: 1d/4h/15m 看空 + 3m OTT 刚翻空 + BTC弱势
 - 出场: 3m OTT 反向翻转（小级别反转）或 4h OTT 翻向（大趋势反转）
+
+v2 关键修复:
+- process_only_new_candles = False: 回测中逐根K线推进，模拟实盘行为
+- _trend_cache: 缓存pytrendseries结果，仅在高级别K线新增时重新计算
+- 仅使用已完成的高级别K线(iloc[:-1])，避免未完成K线的噪声
+- use_custom_stoploss = False: 启用杠杆动态止损
+- adjust_entry_price: 首次入场不加偏移
 """
 
 import logging
 import os
 import sys
-from numpy.lib import math
 from freqtrade.strategy import IStrategy, IntParameter, DecimalParameter
 from pandas import DataFrame, Series
 import talib.abstract as ta
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -39,20 +45,30 @@ class SmallCapHunterV1(IStrategy):
     startup_candle_count = 200
 
     # 风控
-    minimal_roi = {"0": 1.0}
+    minimal_roi = {"0": 0.12, "120": 0.08, "240": 0.05, "480": 0.03, "960": 0}
     trailing_stop = True
-    trailing_stop_positive = 0.08
-    trailing_stop_positive_offset = 0.12
-    trailing_only_offset_is_reached = False
+    trailing_stop_positive = 0.05
+    trailing_stop_positive_offset = 0.08
+    trailing_only_offset_is_reached = True
     use_custom_stoploss = False
 
     can_short = True
-    process_only_new_candles = True
+    # v2: 回测中逐根K线推进，消除pytrendseries全量数据的未来信号
+    process_only_new_candles = False
+
+    # 小币种必须market止损，limit止损跳空时不会成交
+    order_types = {
+        'entry': 'limit',
+        'exit': 'limit',
+        'emergency_exit': 'market',
+        'stoploss': 'market',
+        'stoploss_on_exchange': False,
+    }
     max_open_trades = 5
 
-    # === 马丁DCA加仓 ===
-    position_adjustment_enable = True
-    max_entry_position_adjustment = 2  # 最多加仓2次（共3次入场）
+    # === DCA加仓 (v3: 关闭，DCA在3m周期不可行) ===
+    position_adjustment_enable = False
+    max_entry_position_adjustment = 0
     dca_step = DecimalParameter(0.02, 0.06, default=0.03, space='buy')  # 每次加仓间距
 
     protections = [
@@ -65,9 +81,9 @@ class SmallCapHunterV1(IStrategy):
     ]
 
     # === 风控 ===
-    stoploss = -0.125
-    base_leverage_val = IntParameter(2, 5, default=2, space='buy')
-    max_leverage_val = IntParameter(3, 8, default=5, space='buy')
+    stoploss = -0.30
+    base_leverage_val = IntParameter(5, 10, default=5, space='buy')
+    max_leverage_val = IntParameter(15, 30, default=30, space='buy')
 
     # === OTT 超参 ===
     ott_percent = DecimalParameter(1.0, 2.5, default=1.883, space='buy')
@@ -84,6 +100,12 @@ class SmallCapHunterV1(IStrategy):
     volume_ratio = DecimalParameter(1.0, 3.0, default=1.3, space='buy')
     fourh_change_pct = DecimalParameter(0.01, 0.06, default=0.021, space='buy')
 
+    # === 滚动缓存: 避免每次调用都重算pytrendseries ===
+    # {(pair, timeframe, window, limit): (last_closed_bar_time, trend_series)}
+    _trend_cache: dict = {}
+    _pair_loss_ring: dict = {}  # {pair: [bool,...]} 最近3笔是否止损
+    _pair_jail_until: dict = {}  # {pair: timestamp} 禁闭到何时
+
     def informative_pairs(self):
         pairs = self.dp.current_whitelist()
         inf_pairs = []
@@ -94,13 +116,13 @@ class SmallCapHunterV1(IStrategy):
         inf_pairs.append(('BTC/USDT:USDT', '4h'))
         return inf_pairs
 
-    # ========== pytrendseries 趋势标签 ==========
+    # ========== pytrendseries 趋势标签 (仅用已完成K线) ==========
     @staticmethod
     def compute_trend_labels(df_in: DataFrame, window: int, limit: int) -> Series:
         """
         使用 pytrendseries detecttrend 检测价格形态趋势。
         1=uptrend, -1=downtrend, 0=no_trend。
-        接受 OHLCV dataframe 或单列 close dataframe，自动提取 close 和日期。
+        仅使用已完成K线 (调用方应传入iloc[:-1]数据)。
         """
         from pytrendseries import detecttrend
 
@@ -148,16 +170,46 @@ class SmallCapHunterV1(IStrategy):
 
         return labels
 
+    # ========== 带缓存的趋势计算 (v2: 避免重复调用detecttrend) ==========
+    def _get_cached_trend(self, pair: str, timeframe: str,
+                          df_htf: DataFrame, window: int, limit: int) -> Series:
+        """
+        获取趋势标签。仅使用已完成K线 (iloc[:-1])，缓存结果。
+        只有当高级别K线新增时才重新计算 pytrendseries。
+        """
+        if len(df_htf) < 2:
+            return Series(dtype=float)
+
+        # 仅用已完成K线 (丢弃最后一根可能未完成的K线)
+        df_completed = df_htf.iloc[:-1].copy()
+
+        if len(df_completed) < 10:
+            return Series(dtype=float)
+
+        cache_key = (pair, timeframe, window, limit)
+        last_closed_time = df_completed.index[-1]
+
+        # 检查缓存: 最后一根已完成K线时间未变 → 复用
+        if cache_key in self._trend_cache:
+            cached_time, cached_trend = self._trend_cache[cache_key]
+            if cached_time == last_closed_time:
+                return cached_trend
+
+        # 重新计算趋势
+        trend = self.compute_trend_labels(df_completed, window=window, limit=limit)
+        self._trend_cache[cache_key] = (last_closed_time, trend)
+        return trend
+
     # ========== OTT 指标 (Vectorized) ==========
     def ott(self, dataframe: DataFrame, pds: int, percent: float, cmo_period: int):
         df = dataframe.copy()
         alpha = 2 / (pds + 1)
 
         df["ud1"] = np.where(
-            df["close"] > df["close"].shift(1), (df["close"] - df["close"].shift()), 0.0
+            df["close"] > df["close"].shift(1), (df["close"] - df["close"].shift(1)), 0.0
         )
         df["dd1"] = np.where(
-            df["close"] < df["close"].shift(1), (df["close"].shift() - df["close"]), 0.0
+            df["close"] < df["close"].shift(1), (df["close"].shift(1) - df["close"]), 0.0
         )
         df["UD"] = df["ud1"].rolling(cmo_period).sum()
         df["DD"] = df["dd1"].rolling(cmo_period).sum()
@@ -217,14 +269,6 @@ class SmallCapHunterV1(IStrategy):
         return DataFrame(index=df.index, data={
             "OTT": df["OTT"], "VAR": df["Var"], "DIR": df["dir"],
         })
-
-    def compute_ott_direction(self, dataframe: DataFrame):
-        """计算 OTT 趋势方向: 1=看涨, -1=看空, 0=中性"""
-        ott_data = self.ott(dataframe, self.ott_pds.value,
-                            self.ott_percent.value, self.ott_cmo_period.value)
-        direction = np.where(ott_data['VAR'] > ott_data['OTT'], 1,
-                     np.where(ott_data['VAR'] < ott_data['OTT'], -1, 0))
-        return direction
 
     # ========== 指标填充 ==========
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -299,96 +343,72 @@ class SmallCapHunterV1(IStrategy):
         dataframe['bb_upper'] = bb['upperband']
         dataframe['bb_mid'] = bb['middleband']
 
-        # 成交量衰竭：连续阴线/阳线中量能递减（卖盘/买盘枯竭）
-        dataframe['vol_3bar_avg'] = dataframe['volume'].rolling(3).mean().shift(1)
-        dataframe['sell_exhaustion'] = (
-            (dataframe['bearish_candle'] == 1) &
-            (dataframe['volume'] < dataframe['vol_3bar_avg'] * 0.8) &
-            (dataframe['volume'].shift(1) < dataframe['volume'].shift(2))
-        ).astype(int)
-        dataframe['buy_exhaustion'] = (
-            (dataframe['bullish_candle'] == 1) &
-            (dataframe['volume'] < dataframe['vol_3bar_avg'] * 0.8) &
-            (dataframe['volume'].shift(1) < dataframe['volume'].shift(2))
-        ).astype(int)
-        # 做多回调结束: OTT看涨 + 刚经历>=3根阴线回调 + 当前阳线反弹 + 放量确认
+        # 做多回调结束: OTT看涨≥5根 + 回调≥3阴线 + 阳线放量反弹
         dataframe['pullback_buy'] = (
             (dataframe['ott_dir'] == 1) &
+            (dataframe['ott_bullish_bars'] >= 5) &
             (dataframe['bearish_bars'].shift(1) >= 3) &
             (dataframe['bullish_candle'] == 1) &
-            (dataframe['volume_spike'] > 1.0)
+            (dataframe['volume_spike'] > 1.2)
         ).astype(int)
-        # 做空反弹结束: OTT看空 + 刚经历>=3根阳线反弹 + 当前阴线下跌 + 放量确认
+        # 做空反弹结束: OTT看空≥5根 + 反弹≥3阳线 + 阴线放量下跌
         dataframe['pullback_sell'] = (
             (dataframe['ott_dir'] == -1) &
+            (dataframe['ott_bearish_bars'] >= 5) &
             (dataframe['bullish_bars'].shift(1) >= 3) &
             (dataframe['bearish_candle'] == 1) &
-            (dataframe['volume_spike'] > 1.0)
-        ).astype(int)
-
-        # 抄底做多: 3m OTT偏空 + 连续下跌后卖盘枯竭 + RSI超卖 + 价格在布林下轨附近
-        dataframe['counter_buy'] = (
-            (dataframe['ott_dir'] == -1) &
-            (dataframe['bearish_bars'].shift(1) >= 5) &
-            (dataframe['bullish_candle'] == 1) &
-            (dataframe['rsi'] < 40) &
-            (dataframe['close'] <= dataframe['bb_lower'] * 1.03) &
-            (dataframe['sell_exhaustion'].rolling(3).max() >= 1) &
-            (dataframe['volume_spike'] > 1.1)
-        ).astype(int)
-        # 摸顶做空: 3m OTT偏多 + 连续上涨后买盘枯竭 + RSI超买 + 价格在布林上轨附近
-        dataframe['counter_sell'] = (
-            (dataframe['ott_dir'] == 1) &
-            (dataframe['bullish_bars'].shift(1) >= 5) &
-            (dataframe['bearish_candle'] == 1) &
-            (dataframe['rsi'] > 60) &
-            (dataframe['close'] >= dataframe['bb_upper'] * 0.97) &
-            (dataframe['buy_exhaustion'].rolling(3).max() >= 1) &
-            (dataframe['volume_spike'] > 1.1)
+            (dataframe['volume_spike'] > 1.2)
         ).astype(int)
 
         # === 15m: pytrendseries 趋势检测 + 大阴线/大阳线 ===
         inf_15m = self.dp.get_pair_dataframe(pair=metadata['pair'], timeframe='15m')
+        dataframe['consec_bear_15m'] = 0
+        dataframe['consec_bull_15m'] = 0
         if inf_15m is not None and len(inf_15m) >= 10:
-            # 确保 DateTimeIndex
             df_15m = inf_15m.copy()
             if 'date' in df_15m.columns:
                 df_15m['date'] = pd.to_datetime(df_15m['date'])
                 df_15m.set_index('date', inplace=True)
-            else:
+            elif not isinstance(df_15m.index, pd.DatetimeIndex):
                 logger.warning(f"15m data for {metadata['pair']} has no 'date' column: "
                              f"cols={inf_15m.columns.tolist()}, idx_type={type(inf_15m.index)}")
-            trend_15m = self.compute_trend_labels(
-                df_15m, window=self.trend_15m_window.value, limit=8)
-            dataframe['ott_dir_15m'] = trend_15m.reindex(
-                dataframe.index, method='ffill').fillna(1)
-        else:
-            dataframe['ott_dir_15m'] = 1
 
-        # 15m 大阴线/大阳线检测（用于 custom_exit）
-        df_15m['atr'] = ta.ATR(df_15m, timeperiod=14)
-        df_15m['big_bear'] = (
-            (df_15m['close'] < df_15m['open']) &
-            ((df_15m['open'] - df_15m['close']) > df_15m['atr'] * 0.8)
-        ).astype(int)
-        df_15m['big_bull'] = (
-            (df_15m['close'] > df_15m['open']) &
-            ((df_15m['close'] - df_15m['open']) > df_15m['atr'] * 0.8)
-        ).astype(int)
-        df_15m['consec_bear_15m'] = (
-            df_15m['big_bear']
-            .groupby((df_15m['big_bear'] == 0).cumsum())
-            .cumsum()
-        )
-        df_15m['consec_bull_15m'] = (
-            df_15m['big_bull']
-            .groupby((df_15m['big_bull'] == 0).cumsum())
-            .cumsum()
-        )
-        dataframe['consec_bear_15m'] = df_15m['consec_bear_15m'].reindex(
-            dataframe.index, method='ffill').fillna(0).astype(int)
-        dataframe['consec_bull_15m'] = df_15m['consec_bull_15m'].reindex(
-            dataframe.index, method='ffill').fillna(0).astype(int)
+            # v2: 带缓存的趋势计算 (仅用已完成K线，无未来信号)
+            trend_15m = self._get_cached_trend(
+                metadata['pair'], '15m', df_15m,
+                window=self.trend_15m_window.value, limit=8)
+            if len(trend_15m) > 0:
+                dataframe['ott_dir_15m'] = trend_15m.reindex(
+                    dataframe.index, method='ffill').fillna(0)
+            else:
+                dataframe['ott_dir_15m'] = 0
+
+            # 15m 大阴线/大阳线检测（用于 custom_exit）
+            df_15m['atr'] = ta.ATR(df_15m, timeperiod=14)
+            df_15m['big_bear'] = (
+                (df_15m['close'] < df_15m['open']) &
+                ((df_15m['open'] - df_15m['close']) > df_15m['atr'] * 0.8)
+            ).astype(int)
+            df_15m['big_bull'] = (
+                (df_15m['close'] > df_15m['open']) &
+                ((df_15m['close'] - df_15m['open']) > df_15m['atr'] * 0.8)
+            ).astype(int)
+            df_15m['consec_bear_15m'] = (
+                df_15m['big_bear']
+                .groupby((df_15m['big_bear'] == 0).cumsum())
+                .cumsum()
+            )
+            df_15m['consec_bull_15m'] = (
+                df_15m['big_bull']
+                .groupby((df_15m['big_bull'] == 0).cumsum())
+                .cumsum()
+            )
+            dataframe['consec_bear_15m'] = df_15m['consec_bear_15m'].reindex(
+                dataframe.index, method='ffill').fillna(0).astype(int)
+            dataframe['consec_bull_15m'] = df_15m['consec_bull_15m'].reindex(
+                dataframe.index, method='ffill').fillna(0).astype(int)
+        else:
+            dataframe['ott_dir_15m'] = 0
 
         # === 1d: pytrendseries 趋势检测 ===
         inf_1d = self.dp.get_pair_dataframe(pair=metadata['pair'], timeframe='1d')
@@ -397,31 +417,44 @@ class SmallCapHunterV1(IStrategy):
             if 'date' in df_1d.columns:
                 df_1d['date'] = pd.to_datetime(df_1d['date'])
                 df_1d.set_index('date', inplace=True)
-            trend_1d = self.compute_trend_labels(
-                df_1d, window=self.trend_1d_window.value, limit=3)
-            dataframe['ott_dir_1d'] = trend_1d.reindex(
-                dataframe.index, method='ffill').fillna(1)
+
+            # v2: 带缓存的趋势计算 (仅用已完成K线，无未来信号)
+            trend_1d = self._get_cached_trend(
+                metadata['pair'], '1d', df_1d,
+                window=self.trend_1d_window.value, limit=3)
+            if len(trend_1d) > 0:
+                dataframe['ott_dir_1d'] = trend_1d.reindex(
+                    dataframe.index, method='ffill').fillna(0)
+            else:
+                dataframe['ott_dir_1d'] = 0
         else:
-            dataframe['ott_dir_1d'] = 1
+            dataframe['ott_dir_1d'] = 0
 
         # === 4h: pytrendseries 趋势检测 + 涨跌幅过滤 ===
         inf_4h = self.dp.get_pair_dataframe(pair=metadata['pair'], timeframe='4h')
+        dataframe['4h_change_pct'] = 0
         if inf_4h is not None and len(inf_4h) >= 10:
             df_4h = inf_4h.copy()
             if 'date' in df_4h.columns:
                 df_4h['date'] = pd.to_datetime(df_4h['date'])
                 df_4h.set_index('date', inplace=True)
-            trend_4h = self.compute_trend_labels(
-                df_4h, window=self.trend_4h_window.value, limit=5)
-            dataframe['ott_dir_4h'] = trend_4h.reindex(
-                dataframe.index, method='ffill').fillna(1)
-        else:
-            dataframe['ott_dir_4h'] = 1
 
-        # 4h K线涨跌幅（用于过滤极端K线）
-        df_4h['change_pct'] = (df_4h['close'] - df_4h['open']) / df_4h['open']
-        dataframe['4h_change_pct'] = df_4h['change_pct'].reindex(
-            dataframe.index, method='ffill').fillna(0)
+            # v2: 带缓存的趋势计算 (仅用已完成K线，无未来信号)
+            trend_4h = self._get_cached_trend(
+                metadata['pair'], '4h', df_4h,
+                window=self.trend_4h_window.value, limit=5)
+            if len(trend_4h) > 0:
+                dataframe['ott_dir_4h'] = trend_4h.reindex(
+                    dataframe.index, method='ffill').fillna(0)
+            else:
+                dataframe['ott_dir_4h'] = 0
+
+            # 4h K线涨跌幅（用于过滤极端K线）
+            df_4h['change_pct'] = (df_4h['close'] - df_4h['open']) / df_4h['open']
+            dataframe['4h_change_pct'] = df_4h['change_pct'].reindex(
+                dataframe.index, method='ffill').fillna(0)
+        else:
+            dataframe['ott_dir_4h'] = 0
 
         # === BTC 4h 方向（用于阻断做空） ===
         try:
@@ -431,17 +464,21 @@ class SmallCapHunterV1(IStrategy):
                 if 'date' in df_btc.columns:
                     df_btc['date'] = pd.to_datetime(df_btc['date'])
                     df_btc.set_index('date', inplace=True)
-                btc_trend = self.compute_trend_labels(
-                    df_btc, window=60, limit=5)
-                # 1=uptrend(bullish), -1/0=not bullish
-                btc_dir = np.where(btc_trend == 1, 1, 0)
-                dataframe['btc_bullish'] = Series(
-                    btc_dir, index=btc_trend.index
-                ).reindex(dataframe.index, method='ffill').fillna(0).astype(int)
+
+                # v2: 带缓存的趋势计算 (仅用已完成K线，无未来信号)
+                btc_trend = self._get_cached_trend(
+                    'BTC/USDT:USDT', '4h', df_btc, window=60, limit=5)
+                if len(btc_trend) > 0:
+                    btc_dir = np.where(btc_trend == 1, 1, 0)
+                    dataframe['btc_bullish'] = Series(
+                        btc_dir, index=btc_trend.index
+                    ).reindex(dataframe.index, method='ffill').fillna(0).astype(int)
+                else:
+                    dataframe['btc_bullish'] = 0
             else:
-                dataframe['btc_bullish'] = 1
+                dataframe['btc_bullish'] = 0
         except Exception:
-            dataframe['btc_bullish'] = 1
+            dataframe['btc_bullish'] = 0
 
         return dataframe
 
@@ -451,80 +488,88 @@ class SmallCapHunterV1(IStrategy):
         adx_ok = dataframe['adx'] > self.adx_threshold.value
         vol_ok = dataframe['volume_spike'] > self.volume_ratio.value
         change_lim = self.fourh_change_pct.value
+        # 动量: 创10bar新高不空 / 创10bar新低不多
+        no_new_high = dataframe['close'] <= dataframe['close'].rolling(10).max().shift(1)
+        no_new_low = dataframe['close'] >= dataframe['close'].rolling(10).min().shift(1)
 
-        # === 做多条件（分离三种入场类型，各自打tag）===
+        # MTF共识: ≥2/3 周期方向一致才允许入场
+        bullish_1d = (dataframe['ott_dir_1d'] == 1).astype(int)
+        bullish_4h = (dataframe['ott_dir_4h'] == 1).astype(int)
+        bullish_15m = (dataframe['ott_dir_15m'] == 1).astype(int)
+        bullish_mtf = (bullish_1d + bullish_4h + bullish_15m) >= 2
+
+        bearish_1d = (dataframe['ott_dir_1d'] == -1).astype(int)
+        bearish_4h = (dataframe['ott_dir_4h'] == -1).astype(int)
+        bearish_15m = (dataframe['ott_dir_15m'] == -1).astype(int)
+        bearish_mtf = (bearish_1d + bearish_4h + bearish_15m) >= 2
+
+        # 差币禁闭: 跳过被关禁闭的币
+        pair = metadata['pair']
+        if pair in self._pair_jail_until:
+            if datetime.utcnow() < self._pair_jail_until[pair]:
+                return dataframe  # 还在禁闭期, 不开新仓
+            else:
+                del self._pair_jail_until[pair]  # 禁闭到期, 释放
+
+        # === 做多条件（2种入场类型：翻转 + 回调，互斥）===
         long_base = (
-            (dataframe['ott_dir_1d'] != -1) &
-            (dataframe['ott_dir_4h'] != -1) &
-            (dataframe['ott_dir_15m'] != -1) &
+            bullish_mtf &
             (dataframe['4h_change_pct'] > -change_lim) &
             adx_ok & vol_ok
         )
 
-        # Type A: OTT翻转入场
-        long_flip = long_base & (dataframe['ott_dir_3m_flip_up_recent'] == 1)
+        # Type A: OTT翻转入场 (要求15m同向，避免假突破)
+        long_flip = long_base & (dataframe['ott_dir_3m_flip_up_recent'] == 1) & (dataframe['ott_dir_15m'] == 1)
         dataframe.loc[long_flip, 'enter_long'] = 1
         dataframe.loc[long_flip, 'enter_tag'] = 'flip_up'
+        # 仅对最新K线打日志，避免历史信号刷屏
+        if long_flip.iloc[-1]:
+            i = dataframe.index[-1]
+            logger.info(f"[ENTRY] {metadata['pair']} LONG flip_up "
+                       f"1d={dataframe.at[i,'ott_dir_1d']} 4h={dataframe.at[i,'ott_dir_4h']} 15m={dataframe.at[i,'ott_dir_15m']} "
+                       f"ott3m={dataframe.at[i,'ott_dir']} adx={dataframe.at[i,'adx']:.0f} rsi={dataframe.at[i,'rsi']:.0f} "
+                       f"btc={dataframe.at[i,'btc_bullish']}")
 
-        # Type B: 回调入场
+        # Type B: 回调入场 (趋势已确立后回调结束)
         long_pullback = long_base & (dataframe['pullback_buy'] == 1) & ~long_flip
         dataframe.loc[long_pullback, 'enter_long'] = 1
         dataframe.loc[long_pullback, 'enter_tag'] = 'pullback_buy'
+        if long_pullback.iloc[-1]:
+            i = dataframe.index[-1]
+            logger.info(f"[ENTRY] {metadata['pair']} LONG pullback_buy "
+                       f"1d={dataframe.at[i,'ott_dir_1d']} 4h={dataframe.at[i,'ott_dir_4h']} 15m={dataframe.at[i,'ott_dir_15m']} "
+                       f"ott3m={dataframe.at[i,'ott_dir']} adx={dataframe.at[i,'adx']:.0f} rsi={dataframe.at[i,'rsi']:.0f}")
 
-        # Type C: 逆势抄底（exhaustion点）
-        long_counter = long_base & (dataframe['counter_buy'] == 1) & ~long_flip & ~long_pullback
-        dataframe.loc[long_counter, 'enter_long'] = 1
-        dataframe.loc[long_counter, 'enter_tag'] = 'counter_buy'
-
-        # Type D: DCA加仓（趋势方向上价格回调时持续加仓）
-        # 不要求 adx_ok + vol_ok，比首发信号更宽松，确保加仓窗口持续打开
-        long_dca = (
-            (dataframe['ott_dir_1d'] != -1) &
-            (dataframe['ott_dir_4h'] != -1) &
-            (dataframe['ott_dir_15m'] != -1) &
-            (dataframe['ott_dir'] == 1) &
-            (dataframe['close'] < dataframe['sma_20']) &
-            ~long_flip & ~long_pullback & ~long_counter
-        )
-        dataframe.loc[long_dca, 'enter_long'] = 1
-        dataframe.loc[long_dca, 'enter_tag'] = 'dca_long'
-
-        # === 做空条件（分离三种入场类型）===
+        # === 做空条件（2种入场类型：翻转 + 反弹，互斥）===
         short_base = (
-            (dataframe['ott_dir_1d'] != 1) &
-            (dataframe['ott_dir_4h'] != 1) &
-            (dataframe['ott_dir_15m'] != 1) &
+            bearish_mtf &
             (dataframe['4h_change_pct'] < change_lim) &
             (dataframe['btc_bullish'] == 0) &
+            no_new_high &  # 不空强势上拉的币
             adx_ok & vol_ok
         )
 
-        # Type A: OTT翻转入场
-        short_flip = short_base & (dataframe['ott_dir_3m_flip_down_recent'] == 1)
+        # Type A: OTT翻转入场 (要求15m同向，避免假突破)
+        short_flip = short_base & (dataframe['ott_dir_3m_flip_down_recent'] == 1) & (dataframe['ott_dir_15m'] == -1)
         dataframe.loc[short_flip, 'enter_short'] = 1
         dataframe.loc[short_flip, 'enter_tag'] = 'flip_down'
+        # 仅对最新K线打日志，避免历史信号刷屏
+        if short_flip.iloc[-1]:
+            i = dataframe.index[-1]
+            logger.info(f"[ENTRY] {metadata['pair']} SHORT flip_down "
+                       f"1d={dataframe.at[i,'ott_dir_1d']} 4h={dataframe.at[i,'ott_dir_4h']} 15m={dataframe.at[i,'ott_dir_15m']} "
+                       f"ott3m={dataframe.at[i,'ott_dir']} adx={dataframe.at[i,'adx']:.0f} rsi={dataframe.at[i,'rsi']:.0f} "
+                       f"btc={dataframe.at[i,'btc_bullish']}")
 
-        # Type B: 反弹入场
+        # Type B: 反弹入场 (趋势已确立后反弹结束)
         short_pullback = short_base & (dataframe['pullback_sell'] == 1) & ~short_flip
         dataframe.loc[short_pullback, 'enter_short'] = 1
         dataframe.loc[short_pullback, 'enter_tag'] = 'pullback_sell'
-
-        # Type C: 逆势摸顶（exhaustion点）
-        short_counter = short_base & (dataframe['counter_sell'] == 1) & ~short_flip & ~short_pullback
-        dataframe.loc[short_counter, 'enter_short'] = 1
-        dataframe.loc[short_counter, 'enter_tag'] = 'counter_sell'
-
-        # Type D: DCA加仓（趋势方向上价格反弹时持续加仓）
-        short_dca = (
-            (dataframe['ott_dir_1d'] != 1) &
-            (dataframe['ott_dir_4h'] != 1) &
-            (dataframe['ott_dir_15m'] != 1) &
-            (dataframe['ott_dir'] == -1) &
-            (dataframe['close'] > dataframe['sma_20']) &
-            ~short_flip & ~short_pullback & ~short_counter
-        )
-        dataframe.loc[short_dca, 'enter_short'] = 1
-        dataframe.loc[short_dca, 'enter_tag'] = 'dca_short'
+        if short_pullback.iloc[-1]:
+            i = dataframe.index[-1]
+            logger.info(f"[ENTRY] {metadata['pair']} SHORT pullback_sell "
+                       f"1d={dataframe.at[i,'ott_dir_1d']} 4h={dataframe.at[i,'ott_dir_4h']} 15m={dataframe.at[i,'ott_dir_15m']} "
+                       f"ott3m={dataframe.at[i,'ott_dir']} adx={dataframe.at[i,'adx']:.0f} rsi={dataframe.at[i,'rsi']:.0f}")
 
         return dataframe
 
@@ -548,41 +593,65 @@ class SmallCapHunterV1(IStrategy):
     def adjust_entry_price(self, trade, order_type, amount, rate,
                            time_in_force, side, entry_tag, **kwargs):
         """
-        趋势方向上加仓: 每次加仓挂单在更好价格
+        趋势方向上加仓: 首次入场按当前价，加仓挂单在更好价格
         做多: 回调时加仓，挂单在当前价下方
         做空: 反弹时加仓，挂单在当前价上方
         """
         step = float(self.dca_step.value)
         count = trade.nr_of_successful_entries  # 0=初始, 1=第一次加仓, 2=第二次加仓
 
+        # v2: 首次入场不加偏移
+        if count == 0:
+            return rate
+
         if trade.is_short:
-            adjusted = rate * (1 + step * (count + 1))
+            adjusted = rate * (1 + step * count)
         else:
-            adjusted = rate * (1 - step * (count + 1))
+            adjusted = rate * (1 - step * count)
 
         return adjusted
 
-    # ========== 杠杆 ==========
+    # ========== 杠杆: MTF共识越高杠杆越大 ==========
+    LEV_MAP = {3: 30.0, 2: 20.0, 1: 10.0, 0: 5.0}
+
     def leverage(self, pair: str, current_time: datetime, current_rate: float,
                  proposed_leverage: float, max_leverage: float, entry_tag: str | None,
                  side: str, **kwargs) -> float:
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if len(dataframe) == 0:
-            return float(self.base_leverage_val.value)
+            return 2.0
         last = dataframe.iloc[-1].squeeze()
         atr_ratio = last.get('atr_ratio', 0.03)
-        btc_bull = last.get('btc_bullish', 1)
-        base_lev = float(self.base_leverage_val.value)
-        max_lev = float(self.max_leverage_val.value)
+
         # 高波动降杠杆
         if atr_ratio > 0.08:
-            return min(base_lev, max_leverage)
-        # 1d/4h 双周期看涨 + BTC看涨 → 允许高杠杆
-        tf_1d_bull = last.get('ott_dir_1d', 0) == 1
-        tf_4h_bull = last.get('ott_dir_4h', 0) == 1
-        if tf_1d_bull and tf_4h_bull and btc_bull:
-            return min(max_lev, max_leverage)
-        return min(base_lev, max_leverage)
+            return 2.0
+
+        # 计算MTF共识度
+        if side == 'long':
+            mtf_cnt = (int(last.get('ott_dir_1d', 0) == 1) +
+                       int(last.get('ott_dir_4h', 0) == 1) +
+                       int(last.get('ott_dir_15m', 0) == 1))
+        else:
+            mtf_cnt = (int(last.get('ott_dir_1d', 0) == -1) +
+                       int(last.get('ott_dir_4h', 0) == -1) +
+                       int(last.get('ott_dir_15m', 0) == -1))
+
+        return self.LEV_MAP.get(mtf_cnt, 5.0)
+
+    # ========== 动态止损: 杠杆越高止损越紧，但必须在清算线之上留足缓冲 ==========
+    def custom_stoploss(self, pair: str, trade, current_time: datetime,
+                        current_rate: float, current_profit: float, **kwargs) -> float:
+        leverage = trade.leverage if hasattr(trade, 'leverage') else 5.0
+        # 按杠杆等比缩放止损: 所有仓位最多亏1-1.5%价格波动
+        if leverage >= 25:
+            return -0.35
+        elif leverage >= 15:
+            return -0.30
+        elif leverage >= 8:
+            return -0.25
+        else:
+            return -0.20
 
     # ========== 仓位 ==========
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
@@ -600,13 +669,13 @@ class SmallCapHunterV1(IStrategy):
         atr_ratio = last.get('atr_ratio', 0.03)
         btc_bull = last.get('btc_bullish', 1)
 
-        # 波动率越高仓位越小
+        # 波动率越高仓位越小 (范围30-50 USDT)
         if atr_ratio > 0.06:
-            stake = proposed_stake * 0.3
+            stake = proposed_stake * 0.6
         elif atr_ratio > 0.04:
-            stake = proposed_stake * 0.5
-        elif atr_ratio > 0.025:
             stake = proposed_stake * 0.7
+        elif atr_ratio > 0.025:
+            stake = proposed_stake * 0.85
         else:
             stake = proposed_stake
 
@@ -621,12 +690,24 @@ class SmallCapHunterV1(IStrategy):
 
         return max(min_stake, min(stake, max_stake))
 
+    # ========== 差币禁闭: 最近3笔有2笔止损 → 禁闭24h ==========
+    def confirm_trade_exit(self, pair, trade, order_type, amount, rate,
+                           time_in_force, exit_reason, **kwargs):
+        is_loss = (exit_reason in ('stop_loss', 'liquidation_risk'))
+        ring = self._pair_loss_ring.setdefault(pair, [])
+        ring.append(is_loss)
+        if len(ring) > 3:
+            ring.pop(0)
+        if ring.count(True) >= 2:
+            self._pair_jail_until[pair] = datetime.utcnow().replace(hour=0, minute=0, second=0) + timedelta(days=1)
+            logger.info(f"[JAIL] {pair} 禁闭24h (最近3笔: {ring})")
+        return True  # 允许出场
+
     # ========== 动态出场 ==========
     def custom_exit(self, pair: str, trade, current_time: datetime,
                     current_rate: float, current_profit: float, **kwargs):
-        # 清算保护（最高优先级）
-        leverage = trade.leverage if hasattr(trade, 'leverage') else 5.0
-        if current_profit < -(1.0 / leverage) * 0.85:
+        # 清算保护 (全仓下清算线很远, -50%才真正危险)
+        if current_profit < -0.50:
             return 'liquidation_risk'
 
         # 亏损时交给 stoploss / trailing stop 处理
@@ -639,24 +720,13 @@ class SmallCapHunterV1(IStrategy):
         last = dataframe.iloc[-1].squeeze()
         prev = dataframe.iloc[-2].squeeze()
 
-        enter_tag = getattr(trade, 'enter_tag', '')
-
-        # === Counter-trend 快进快出：达到目标利润就跑 ===
-        if enter_tag in ('counter_buy', 'counter_sell'):
-            # 如果 OTT 已经翻转同向 → 升级为趋势交易，不提前退出
-            if enter_tag == 'counter_buy' and last.get('ott_dir', 0) == 1:
-                pass  # OTT翻多了，继续持有用正常出场逻辑
-            elif enter_tag == 'counter_sell' and last.get('ott_dir', 0) == -1:
-                pass  # OTT翻空了，继续持有
-            else:
-                # 逆势交易，快进快出
-                if current_profit > 0.04:
-                    return 'counter_tp'
-                # 反弹到布林中轨也走
-                if enter_tag == 'counter_buy' and last.get('close', 0) >= last.get('bb_mid', 999999):
-                    return 'counter_bb_mid'
-                if enter_tag == 'counter_sell' and last.get('close', 0) <= last.get('bb_mid', 0):
-                    return 'counter_bb_mid'
+        # === 3m OTT 翻转立即出场（趋势方向改变） ===
+        if trade.is_short:
+            if last.get('ott_dir', 0) == 1 and prev.get('ott_dir', 0) == -1:
+                return 'ott_flip_short'
+        else:
+            if last.get('ott_dir', 0) == -1 and prev.get('ott_dir', 0) == 1:
+                return 'ott_flip_long'
 
         if trade.is_short:
             # === 做空出场: 跌到尽头 ===

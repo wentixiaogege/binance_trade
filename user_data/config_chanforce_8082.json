@@ -1,0 +1,38 @@
+{
+    "max_open_trades": 15,
+    "stake_currency": "USDT",
+    "stake_amount": 20,
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    "dry_run": true,
+    "dry_run_wallet": 1000,
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "entry_pricing": {"price_side": "other", "use_order_book": true, "order_book_top": 1},
+    "exit_pricing": {"price_side": "other", "use_order_book": true, "order_book_top": 1},
+    "exchange": {
+        "name": "binance",
+        "key": "",
+        "secret": "",
+        "ccxt_config": {"enableRateLimit": true, "options": {"defaultType": "swap"}},
+        "pair_whitelist": [
+            "BTC/USDT:USDT","ETH/USDT:USDT","BNB/USDT:USDT","SOL/USDT:USDT","XRP/USDT:USDT",
+            "DOGE/USDT:USDT","ADA/USDT:USDT","TRX/USDT:USDT","AVAX/USDT:USDT","LINK/USDT:USDT",
+            "1000PEPE/USDT:USDT","WIF/USDT:USDT","POPCAT/USDT:USDT","NEIRO/USDT:USDT",
+            "TURBO/USDT:USDT","AIXBT/USDT:USDT","VIRTUAL/USDT:USDT","TRUMP/USDT:USDT",
+            "FARTCOIN/USDT:USDT","PNUT/USDT:USDT","BOME/USDT:USDT","MEW/USDT:USDT",
+            "MOODENG/USDT:USDT","GOAT/USDT:USDT","1000BONK/USDT:USDT","PENGU/USDT:USDT",
+            "ACT/USDT:USDT","JELLYJELLY/USDT:USDT"
+        ]
+    },
+    "pairlists": [{"method": "StaticPairList"}],
+    "telegram": {"enabled": false, "token": "", "chat_id": ""},
+    "api_server": {
+        "enabled": true, "listen_ip_address": "0.0.0.0", "listen_port": 8082,
+        "username": "freqtrade", "password": "freqtrade123"
+    },
+    "bot_name": "ChanForce-8082",
+    "db_url": "sqlite:///tradesv3.dryrun_chanforce.sqlite",
+    "initial_state": "running",
+    "internals": {"process_throttle_secs": 5}
+}

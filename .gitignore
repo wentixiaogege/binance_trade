@@ -28,6 +28,22 @@ __pycache__/
 /tmp/
 *.tmp
 
+# Database
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+
+# Backups
+*.bak
+*.bak.*
+
+# FreqUI build artifacts
+/tmp/
+
+# Claude
+.claude/
+
 # Sensitive
 config.json
 config_future.json
