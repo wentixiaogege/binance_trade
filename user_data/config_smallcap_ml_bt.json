@@ -66,7 +66,7 @@
     "identifier": "smallcap_ml_v1",
     "live_retrain_hours": 0,
     "train_period_days": 30,
-    "backtest_period_days": 2,
+    "backtest_period_days": 7,
     "model_save_type": "joblib",
     "fit_live_predictions_candles": 300,
     "purge_old_models": true,
@@ -92,10 +92,15 @@
       "shuffle": false
     },
     "model_training_parameters": {
-      "n_estimators": 200,
-      "learning_rate": 0.05,
-      "max_depth": 4,
-      "num_leaves": 31,
+      "n_estimators": 500,
+      "learning_rate": 0.02,
+      "max_depth": 6,
+      "num_leaves": 63,
+      "min_child_samples": 50,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8,
+      "reg_alpha": 0.1,
+      "reg_lambda": 0.1,
       "verbosity": -1,
       "random_state": 42
     }

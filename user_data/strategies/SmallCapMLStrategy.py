@@ -69,14 +69,14 @@ class SmallCapMLStrategy(IStrategy):
     startup_candle_count = 200
 
     # === 风险控制 ===
-    stoploss = -0.30
+    stoploss = -0.20
     max_open_trades = 5
 
-    minimal_roi = {"0": 0.12, "120": 0.08, "240": 0.05, "480": 0.03, "960": 0}
+    minimal_roi = {"0": 0.15, "120": 0.10, "240": 0.06, "480": 0.03, "960": 0}
 
     trailing_stop = True
-    trailing_stop_positive = 0.05
-    trailing_stop_positive_offset = 0.08
+    trailing_stop_positive = 0.04
+    trailing_stop_positive_offset = 0.06
     trailing_only_offset_is_reached = True
     use_custom_stoploss = True
 
@@ -118,7 +118,7 @@ class SmallCapMLStrategy(IStrategy):
         "feature_parameters": {
             "include_timeframes": ["15m"],
             "include_corr_pairlist": ["BTC/USDT:USDT"],
-            "label_period_candles": 20,
+            "label_period_candles": 60,
             "include_shifted_candles": 2,
             "DI_threshold": 0.9,
             "weight_factor": 0.8,
@@ -143,14 +143,14 @@ class SmallCapMLStrategy(IStrategy):
     }
 
     # === 入场阈值 ===
-    ml_long_threshold = DecimalParameter(0.002, 0.015, default=0.005, space='buy')
-    ml_short_threshold = DecimalParameter(-0.015, -0.002, default=-0.005, space='buy')
+    # 预测符号 + 最小强度 (预测>0做多, <0做空)
+    ml_strength = DecimalParameter(0.0001, 0.003, default=0.0005, space='buy')
     rsi_dip_max = IntParameter(25, 45, default=35, space='buy')
     rsi_bounce_min = IntParameter(55, 75, default=65, space='buy')
 
     # === 杠杆 ===
-    base_leverage_val = IntParameter(3, 8, default=5, space='buy')
-    max_leverage_val = IntParameter(10, 30, default=20, space='buy')
+    base_leverage_val = IntParameter(2, 5, default=3, space='buy')
+    max_leverage_val = IntParameter(5, 15, default=8, space='buy')
 
     # === 差币禁闭缓存 ===
     _pair_loss_ring: dict = {}
@@ -162,9 +162,7 @@ class SmallCapMLStrategy(IStrategy):
 
     def set_freqai_targets(self, dataframe: DataFrame,
                             metadata: dict) -> DataFrame:
-        """定义ML目标: 未来20根K线的标准化收益率"""
-        # FreqAI 默认目标列: &-s_target
-        # 预测未来20根3m K线 (1小时) 的价格变化率
+        """定义ML目标: 未来60根K线(5小时)的收益率"""
         label_period = 20  # 与 config 中 label_period_candles 保持一致
         future_close = dataframe['close'].shift(-label_period)
         current_close = dataframe['close']
@@ -401,23 +399,26 @@ class SmallCapMLStrategy(IStrategy):
         pred_col = '&-s_target'
         do_predict_col = 'do_predict'
         if pred_col not in dataframe.columns:
-            logger.warning(f"[ML] {pair}: no prediction column '{pred_col}' in dataframe")
             return dataframe
 
         prediction = dataframe[pred_col]
         pred_mean = prediction.rolling(5).mean()
 
-        # FreqAI 置信度: do_predict=1 表示预测可信 (DI < threshold)
+        # FreqAI 置信度
         if do_predict_col in dataframe.columns:
             ml_confident = dataframe[do_predict_col].astype(bool)
         else:
-            ml_confident = True  # 回测兼容
+            ml_confident = True
+
+        # ML预测符号 + 最小强度过滤
+        # pred_mean > 0: 看涨, pred_mean < 0: 看跌
+        strength = self.ml_strength.value
 
         # ═══════════════════════════════════════════════════════
-        # 做多: ML看涨 + 置信度高 + 回调下跌耗尽 → 入场做多
+        # 做多: ML看涨 + 回调下跌耗尽 → 入场做多
         # ═══════════════════════════════════════════════════════
 
-        ml_long = (pred_mean > self.ml_long_threshold.value) & ml_confident
+        ml_long = (pred_mean > strength) & ml_confident
         adx_ok = dataframe['adx'] > 15
 
         # Type A: 回调耗尽入场
@@ -452,10 +453,10 @@ class SmallCapMLStrategy(IStrategy):
             )
 
         # ═══════════════════════════════════════════════════════
-        # 做空: ML看跌 + 置信度高 + 反弹上涨耗尽 → 入场做空
+        # 做空: ML看跌 + 反弹上涨耗尽 → 入场做空
         # ═══════════════════════════════════════════════════════
 
-        ml_short = (pred_mean < self.ml_short_threshold.value) & ml_confident
+        ml_short = (pred_mean < -strength) & ml_confident
 
         # Type A: 反弹耗尽入场
         # ML预测跌 + 连续阳线后阴线反转 + 放量 = 买压耗尽，顺势做空
@@ -612,15 +613,15 @@ class SmallCapMLStrategy(IStrategy):
 
     def custom_stoploss(self, pair: str, trade, current_time: datetime,
                         current_rate: float, current_profit: float, **kwargs) -> float:
-        leverage = trade.leverage if hasattr(trade, 'leverage') else 5.0
-        if leverage >= 25:
-            return -0.35
-        elif leverage >= 15:
-            return -0.30
+        leverage = trade.leverage if hasattr(trade, 'leverage') else 3.0
+        if leverage >= 12:
+            return -0.22
         elif leverage >= 8:
-            return -0.25
-        else:
             return -0.20
+        elif leverage >= 5:
+            return -0.15
+        else:
+            return -0.12
 
     # ========================================================================
     # 仓位: ATR波动率 + BTC方向调整
