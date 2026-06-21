@@ -30,7 +30,7 @@
   "dry_run": true,
   "dry_run_wallet": 1000,
   "max_open_trades": 15,
-  "timeframe": "3m",
+  "timeframe": "5m",
   "timezone": "Asia/Shanghai",
   "datadir": "user_data",
   "db_url": "sqlite:///tradesv3.dryrun_smallcap_ml.sqlite",
@@ -77,7 +77,7 @@
     "write_metrics_to_disk": true,
     "data_kitchen_thread_count": 2,
     "feature_parameters": {
-      "include_timeframes": ["3m", "15m", "1h"],
+      "include_timeframes": ["15m", "1h"],
       "include_corr_pairlist": ["BTC/USDT:USDT"],
       "label_period_candles": 20,
       "include_shifted_candles": 2,
@@ -85,7 +85,8 @@
       "weight_factor": 0.8,
       "principal_component_analysis": false,
       "use_SVM_to_remove_outliers": true,
-      "indicator_max_period_candles": 100
+      "indicator_max_period_candles": 100,
+      "indicator_periods_candles": [10, 20, 50]
     },
     "data_split_parameters": {
       "test_size": 0.15,

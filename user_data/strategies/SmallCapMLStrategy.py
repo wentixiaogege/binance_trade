@@ -62,7 +62,7 @@ class SmallCapMLStrategy(IStrategy):
     INTERFACE_VERSION: int = 3
 
     # === 基础配置 ===
-    timeframe = '3m'
+    timeframe = '5m'
     can_short = True
     process_only_new_candles = True  # FreqAI 要求 True
     use_exit_signal = True
@@ -116,7 +116,7 @@ class SmallCapMLStrategy(IStrategy):
         "fit_live_predictions_candles": 300,
         "purge_old_models": True,
         "feature_parameters": {
-            "include_timeframes": ["3m", "15m", "1h"],
+            "include_timeframes": ["15m"],
             "include_corr_pairlist": ["BTC/USDT:USDT"],
             "label_period_candles": 20,
             "include_shifted_candles": 2,
@@ -125,6 +125,7 @@ class SmallCapMLStrategy(IStrategy):
             "principal_component_analysis": False,
             "use_SVM_to_remove_outliers": True,
             "indicator_max_period_candles": 100,
+            "indicator_periods_candles": [10, 20, 50],
         },
         "data_split_parameters": {
             "test_size": 0.15,
@@ -159,146 +160,126 @@ class SmallCapMLStrategy(IStrategy):
     # FreqAI Feature Engineering
     # ========================================================================
 
+    def set_freqai_targets(self, dataframe: DataFrame,
+                            metadata: dict) -> DataFrame:
+        """定义ML目标: 未来20根K线的标准化收益率"""
+        # FreqAI 默认目标列: &-s_target
+        # 预测未来20根3m K线 (1小时) 的价格变化率
+        label_period = 20  # 与 config 中 label_period_candles 保持一致
+        future_close = dataframe['close'].shift(-label_period)
+        current_close = dataframe['close']
+        dataframe['&-s_target'] = (future_close - current_close) / (current_close + 1e-9)
+        return dataframe
+
+    def feature_engineering_expand_basic(self, dataframe: DataFrame,
+                                          metadata: dict) -> DataFrame:
+        """最基础特征 (FreqAI首先调用此方法，默认无lookback)"""
+        dataframe["%-pct-change"] = dataframe["close"].pct_change()
+        dataframe["%-raw_volume"] = dataframe["volume"]
+        dataframe["%-raw_price"] = dataframe["close"]
+        return dataframe
+
     def feature_engineering_standard(self, dataframe: DataFrame,
                                       metadata: dict) -> DataFrame:
-        """基础特征 (保留在原始周期)"""
+        """基础特征 (保留在原始周期) — 精简版，避免NaN"""
         df = dataframe.copy()
 
-        # 时间特征
+        # 时间特征 (无lookback)
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'])
             df['%-hour'] = df['date'].dt.hour
-            df['%-day_of_week'] = df['date'].dt.dayofweek
+            df['%-day'] = df['date'].dt.dayofweek
 
-        # 价格特征
+        # 原始价格 (无lookback)
         df['%-raw_close'] = df['close']
         df['%-raw_open'] = df['open']
         df['%-raw_high'] = df['high']
         df['%-raw_low'] = df['low']
         df['%-raw_volume'] = df['volume']
 
-        # 收益率
-        df['%-returns_1'] = df['close'].pct_change(1)
-        df['%-returns_3'] = df['close'].pct_change(3)
-        df['%-returns_5'] = df['close'].pct_change(5)
+        # 简单收益率 (短lookback)
+        df['%-ret1'] = df['close'].pct_change(1)
+        df['%-ret5'] = df['close'].pct_change(5)
+        df['%-ret10'] = df['close'].pct_change(10)
 
-        # 蜡烛形态
-        df['%-body_size'] = abs(df['close'] - df['open'])
-        df['%-body_ratio'] = df['%-body_size'] / (df['high'] - df['low'] + 1e-9)
-        df['%-upper_shadow'] = df['high'] - df[['open', 'close']].max(axis=1)
-        df['%-lower_shadow'] = df[['open', 'close']].min(axis=1) - df['low']
-        df['%-hl_ratio'] = (df['high'] - df['close']) / (df['high'] - df['low'] + 1e-9)
+        # 蜡烛形态 (无lookback)
+        df['%-body'] = abs(df['close'] - df['open']) / (df['close'] + 1e-9)
+        df['%-wick_top'] = (df['high'] - df[['open', 'close']].max(axis=1)) / (df['close'] + 1e-9)
+        df['%-wick_bot'] = (df[['open', 'close']].min(axis=1) - df['low']) / (df['close'] + 1e-9)
+        df['%-hl_range'] = (df['high'] - df['low']) / (df['close'] + 1e-9)
 
-        # 波动率
-        df['%-volatility_20'] = df['close'].rolling(20).std() / df['close']
-
-        # Volume
-        df['%-volume_sma_20'] = ta.SMA(df['volume'], timeperiod=20)
-        df['%-volume_ratio'] = df['volume'] / (df['%-volume_sma_20'] + 1e-9)
-
-        # RSI
+        # RSI (短周期)
         df['%-rsi'] = ta.RSI(df, timeperiod=14)
+
+        # EMA (短周期)
+        df['%-ema_12'] = ta.EMA(df, timeperiod=12)
+        df['%-ema_26'] = ta.EMA(df, timeperiod=26)
+        df['%-ema_ratio'] = df['%-ema_12'] / (df['%-ema_26'] + 1e-9)
 
         # MACD
         macd = ta.MACD(df)
         df['%-macd'] = macd['macd']
-        df['%-macdsignal'] = macd['macdsignal']
         df['%-macdhist'] = macd['macdhist']
 
         # ATR
         df['%-atr'] = ta.ATR(df, timeperiod=14)
-        df['%-atr_ratio'] = df['%-atr'] / df['close']
+        df['%-atr_pct'] = df['%-atr'] / (df['close'] + 1e-9)
 
-        # ADX
-        df['%-adx'] = ta.ADX(df, timeperiod=14)
+        # Volume ratio
+        df['%-vol_ma'] = ta.SMA(df['volume'], timeperiod=20)
+        df['%-vol_ratio'] = df['volume'] / (df['%-vol_ma'] + 1e-9)
 
-        # Bollinger Bands
-        bb_upper, bb_mid, bb_lower = ta.BBANDS(df, timeperiod=20, nbdevup=2, nbdevdn=2)
-        df['%-bb_width'] = (bb_upper - bb_lower) / (bb_mid + 1e-9)
-        df['%-bb_position'] = (df['close'] - bb_lower) / (bb_upper - bb_lower + 1e-9)
+        # 连续方向
+        df['%-up'] = (df['close'] > df['close'].shift(1)).astype(int)
+        df['%-dn'] = (df['close'] < df['close'].shift(1)).astype(int)
 
-        # EMA 趋势 (多周期)
-        for period in [12, 26, 50]:
-            df[f'%-ema_{period}'] = ta.EMA(df, timeperiod=period)
-            df[f'%-close_ema_{period}'] = df['close'] / (df[f'%-ema_{period}'] + 1e-9)
-
-        # EMA 多排/空排
-        df['%-ema_bullish'] = (df['%-ema_12'] > df['%-ema_26']).astype(int)
-
-        # CCI
-        df['%-cci'] = ta.CCI(df, timeperiod=14)
-
-        # MFI
-        df['%-mfi'] = ta.MFI(df, timeperiod=14)
-
-        # 连续涨跌K线数
-        df['%-up_candle'] = (df['close'] > df['close'].shift(1)).astype(int)
-        df['%-up_streak'] = (df['%-up_candle']
-                             .groupby((df['%-up_candle'] == 0).cumsum())
-                             .cumsum())
-        df['%-dn_candle'] = (df['close'] < df['close'].shift(1)).astype(int)
-        df['%-dn_streak'] = (df['%-dn_candle']
-                             .groupby((df['%-dn_candle'] == 0).cumsum())
-                             .cumsum())
-
-        # 填充 NaN
+        # 先bfill再fillna
+        df.bfill(inplace=True)
         df.fillna(0, inplace=True)
-
         return df
 
     def feature_engineering_expand_all(self, dataframe: DataFrame,
                                         period: int,
                                         metadata: dict) -> DataFrame:
-        """扩展特征 (在每个周期上自动计算)"""
+        """扩展特征 (FreqAI在每个include_timeframe上调用此方法)"""
         df = dataframe.copy()
 
-        # 基础指标 (FreqAI 会自动在每个 include_timeframes 上调用此方法)
-        df["%-rsi-period"] = ta.RSI(df, timeperiod=14)
-        df["%-roc-period"] = ta.ROC(df, timeperiod=5)
+        # 使用 period 参数避免 lookback 超过数据长度
+        p = min(period, 14)  # 不超过14
 
-        # Bollinger Bands
-        bb_upper = ta.BBANDS(df, timeperiod=20, nbdevup=2, nbdevdn=2)[0]
-        bb_lower = ta.BBANDS(df, timeperiod=20, nbdevup=2, nbdevdn=2)[2]
-        bb_mid = ta.BBANDS(df, timeperiod=20, nbdevup=2, nbdevdn=2)[1]
-        df["%-bb_width-period"] = (bb_upper - bb_lower) / (bb_mid + 1e-9)
+        # RSI & ROC
+        df["%-rsi-period"] = ta.RSI(df, timeperiod=max(p, 5))
+        df["%-roc-period"] = ta.ROC(df, timeperiod=min(p, 5))
 
         # EMA
-        for p in [12, 26, 50]:
-            df[f"%-ema_{p}-period"] = ta.EMA(df, timeperiod=p)
-            df[f"%-close_ema_{p}-period"] = df['close'] / (df[f"%-ema_{p}-period"] + 1e-9)
+        df["%-ema_fast-period"] = ta.EMA(df, timeperiod=max(p, 6))
+        df["%-ema_slow-period"] = ta.EMA(df, timeperiod=max(p * 2, 12))
+        df["%-close_ema_fast-period"] = df['close'] / (df["%-ema_fast-period"] + 1e-9)
 
         # ATR
-        df["%-atr-period"] = ta.ATR(df, timeperiod=14)
+        df["%-atr-period"] = ta.ATR(df, timeperiod=max(p, 7))
         df["%-atr_ratio-period"] = df["%-atr-period"] / (df['close'] + 1e-9)
 
-        # Volume
-        df["%-volume_sma-period"] = ta.SMA(df['volume'], timeperiod=20)
-        df["%-volume_ratio-period"] = df['volume'] / (df["%-volume_sma-period"] + 1e-9)
+        # Volume ratio
+        df["%-vol_sma-period"] = ta.SMA(df['volume'], timeperiod=max(p, 10))
+        df["%-vol_ratio-period"] = df['volume'] / (df["%-vol_sma-period"] + 1e-9)
 
         # MACD
         macd = ta.MACD(df)
         df['%-macd-period'] = macd['macd']
         df['%-macdhist-period'] = macd['macdhist']
 
-        # ADX
-        df['%-adx-period'] = ta.ADX(df, timeperiod=14)
-
-        # Price action
-        df["%-pct_change-period"] = df['close'].pct_change()
+        # Price action (no lookback)
         df["%-hl_ratio-period"] = (df['high'] - df['low']) / (df['close'] + 1e-9)
-        df["%-body_ratio-period"] = abs(df['close'] - df['open']) / (df['high'] - df['low'] + 1e-9)
 
-        # Lag features
-        for lag in range(1, 4):
-            df[f"%-close_lag_{lag}-period"] = df['close'].shift(lag)
-            df[f"%-returns_lag_{lag}-period"] = df['close'].pct_change(lag)
+        # Returns
+        df["%-ret-period"] = df['close'].pct_change(3)
 
-        # 连续方向
-        df['%-up-period'] = (df['close'] > df['close'].shift(1)).astype(int)
-        df['%-up_streak-period'] = (df['%-up-period']
-                                    .groupby((df['%-up-period'] == 0).cumsum())
-                                    .cumsum())
+        # Lag (no NaN from shift if we backfill)
+        df["%-close_lag-period"] = df['close'].shift(1)
 
+        # 先填充 shift 产生的 NaN，再填充其余
+        df.bfill(inplace=True)
         df.fillna(0, inplace=True)
         return df
 
