@@ -1,0 +1,105 @@
+{
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "ccxt_config": {
+      "enableRateLimit": true,
+      "options": {
+        "defaultType": "swap"
+      }
+    },
+    "pair_whitelist": [
+      "HYPE/USDT:USDT",
+      "ZEC/USDT:USDT",
+      "BEAT/USDT:USDT",
+      "IN/USDT:USDT",
+      "GRASS/USDT:USDT",
+      "XAU/USDT:USDT",
+      "ONDO/USDT:USDT",
+      "TAO/USDT:USDT",
+      "WLD/USDT:USDT",
+      "XAG/USDT:USDT"
+    ],
+    "pair_blacklist": []
+  },
+  "trading_mode": "futures",
+  "margin_mode": "cross",
+  "stake_currency": "USDT",
+  "stake_amount": 50,
+  "dry_run": true,
+  "dry_run_wallet": 1000,
+  "max_open_trades": 15,
+  "timeframe": "3m",
+  "timezone": "Asia/Shanghai",
+  "datadir": "user_data",
+  "db_url": "sqlite:///tradesv3.dryrun_smallcap_ml.sqlite",
+  "bot_name": "SmallCapML-8087",
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "entry_pricing": {
+    "price_side": "same",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "exit_pricing": {
+    "price_side": "same",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "unfilledtimeout": {
+    "entry": 15,
+    "exit": 15,
+    "exit_timeout_count": 0,
+    "unit": "minutes"
+  },
+  "api_server": {
+    "enabled": true,
+    "listen_ip_address": "0.0.0.0",
+    "listen_port": 8087,
+    "username": "freqtrade",
+    "password": "freqtrade123"
+  },
+  "freqai": {
+    "enabled": true,
+    "identifier": "smallcap_ml_v1",
+    "live_retrain_hours": 24,
+    "expiration_hours": 168,
+    "train_period_days": 30,
+    "backtest_period_days": 7,
+    "fit_live_predictions_candles": 300,
+    "purge_old_models": true,
+    "save_backtest_models": true,
+    "continual_learning": true,
+    "write_metrics_to_disk": true,
+    "data_kitchen_thread_count": 2,
+    "feature_parameters": {
+      "include_timeframes": ["3m", "15m", "1h"],
+      "include_corr_pairlist": ["BTC/USDT:USDT"],
+      "label_period_candles": 20,
+      "include_shifted_candles": 2,
+      "DI_threshold": 0.9,
+      "weight_factor": 0.8,
+      "principal_component_analysis": false,
+      "use_SVM_to_remove_outliers": true,
+      "indicator_max_period_candles": 100
+    },
+    "data_split_parameters": {
+      "test_size": 0.15,
+      "random_state": 42,
+      "shuffle": false
+    },
+    "model_training_parameters": {
+      "n_estimators": 300,
+      "learning_rate": 0.03,
+      "max_depth": 5,
+      "num_leaves": 31,
+      "verbosity": -1,
+      "random_state": 42
+    }
+  },
+  "freqaimodel": "LightGBMRegressor"
+}
