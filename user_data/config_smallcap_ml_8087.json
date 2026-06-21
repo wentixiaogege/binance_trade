@@ -7,6 +7,11 @@
       "enableRateLimit": true,
       "options": {
         "defaultType": "swap"
+      },
+      "aiohttp_proxy": "http://127.0.0.1:3067",
+      "proxies": {
+        "http": "socks5://127.0.0.1:3067",
+        "https": "socks5h://127.0.0.1:3067"
       }
     },
     "pair_whitelist": [

@@ -143,8 +143,8 @@ class SmallCapMLStrategy(IStrategy):
     }
 
     # === 入场阈值 ===
-    ml_long_threshold = DecimalParameter(0.002, 0.015, default=0.005, space='buy')
-    ml_short_threshold = DecimalParameter(-0.015, -0.002, default=-0.005, space='buy')
+    ml_long_threshold = DecimalParameter(0.0005, 0.010, default=0.002, space='buy')
+    ml_short_threshold = DecimalParameter(-0.010, -0.0005, default=-0.002, space='buy')
     rsi_dip_max = IntParameter(25, 45, default=35, space='buy')
     rsi_bounce_min = IntParameter(55, 75, default=65, space='buy')
 
@@ -325,39 +325,37 @@ class SmallCapMLStrategy(IStrategy):
         dataframe['no_new_low'] = (dataframe['close'] >= dataframe['low_10']).astype(int)
 
         # === 做多: 回调下跌耗尽检测 ===
-        # 条件: EMA多头排列 + 连续阴线≥3根(卖压消耗) + 阳线反转 + 放量确认
+        # Type A: 连续阴线≥2根后阳线反转 (卖压耗尽)
         dataframe['exhaustion_buy_signal'] = (
             (dataframe['ema_12'] > dataframe['ema_26']) &      # 大趋势上涨
-            (dataframe['bearish_bars'].shift(1) >= 3) &         # 回调下跌≥3根 (卖压耗尽)
-            (dataframe['bullish_candle'] == 1) &                # 阳线反转 (耗尽确认)
-            (dataframe['volume_ratio'] > 1.2)                   # 放量确认
+            (dataframe['bearish_bars'].shift(1) >= 2) &         # 回调≥2根阴线
+            (dataframe['bullish_candle'] == 1) &                # 阳线反转 (耗尽)
+            (dataframe['volume_ratio'] > 1.0)                   # 放量
         ).astype(int)
 
-        # RSI 超卖反弹 (回调耗尽辅助信号)
+        # Type B: RSI 超卖回升 (动量耗尽)
         dataframe['rsi_oversold_bounce'] = (
             (dataframe['ema_12'] > dataframe['ema_26']) &
-            (dataframe['rsi'].shift(1) < 35) &                  # 前一根RSI超卖
-            (dataframe['rsi'] > dataframe['rsi'].shift(1)) &    # RSI回升 (耗尽)
-            (dataframe['bullish_candle'] == 1) &
-            (dataframe['volume_ratio'] > 1.0)
+            (dataframe['rsi'].shift(1) < 40) &
+            (dataframe['rsi'] > dataframe['rsi'].shift(1)) &
+            (dataframe['bullish_candle'] == 1)
         ).astype(int)
 
         # === 做空: 反弹上涨耗尽检测 ===
-        # 条件: EMA空头排列 + 连续阳线≥3根(买压消耗) + 阴线反转 + 放量确认
+        # Type A: 连续阳线≥2根后阴线反转 (买压耗尽)
         dataframe['exhaustion_sell_signal'] = (
             (dataframe['ema_12'] < dataframe['ema_26']) &      # 大趋势下跌
-            (dataframe['bullish_bars'].shift(1) >= 3) &         # 反弹上涨≥3根 (买压耗尽)
-            (dataframe['bearish_candle'] == 1) &                # 阴线反转 (耗尽确认)
-            (dataframe['volume_ratio'] > 1.2)                   # 放量确认
+            (dataframe['bullish_bars'].shift(1) >= 2) &         # 反弹≥2根阳线
+            (dataframe['bearish_candle'] == 1) &                # 阴线反转 (耗尽)
+            (dataframe['volume_ratio'] > 1.0)                   # 放量
         ).astype(int)
 
-        # RSI 超买回落 (反弹耗尽辅助信号)
+        # Type B: RSI 超买回落 (动量耗尽)
         dataframe['rsi_overbought_fade'] = (
             (dataframe['ema_12'] < dataframe['ema_26']) &
-            (dataframe['rsi'].shift(1) > 65) &                  # 前一根RSI超买
-            (dataframe['rsi'] < dataframe['rsi'].shift(1)) &    # RSI回落 (耗尽)
-            (dataframe['bearish_candle'] == 1) &
-            (dataframe['volume_ratio'] > 1.0)
+            (dataframe['rsi'].shift(1) > 60) &
+            (dataframe['rsi'] < dataframe['rsi'].shift(1)) &
+            (dataframe['bearish_candle'] == 1)
         ).astype(int)
 
         # === BTC 4h 方向 (做空过滤) ===
@@ -431,13 +429,24 @@ class SmallCapMLStrategy(IStrategy):
             ml_long &
             (dataframe['rsi_oversold_bounce'] == 1) &
             adx_ok &
-            ~long_exhaustion  # 不与Type A重复
+            ~long_exhaustion
         )
         dataframe.loc[long_rsi_exhaustion, 'enter_long'] = 1
         dataframe.loc[long_rsi_exhaustion, 'enter_tag'] = 'ml_rsi_exhaustion_long'
 
+        # Type C: 纯趋势入场 (ML看涨 + EMA多头, 不需要耗尽形态)
+        long_trend = (
+            ml_long &
+            (dataframe['ema_12'] > dataframe['ema_26']) &
+            (dataframe['close'] > dataframe['ema_12'] * 0.995) &
+            adx_ok &
+            ~long_exhaustion & ~long_rsi_exhaustion
+        )
+        dataframe.loc[long_trend, 'enter_long'] = 1
+        dataframe.loc[long_trend, 'enter_tag'] = 'ml_trend_long'
+
         # 日志
-        if long_exhaustion.iloc[-1] or long_rsi_exhaustion.iloc[-1]:
+        if long_exhaustion.iloc[-1] or long_rsi_exhaustion.iloc[-1] or long_trend.iloc[-1]:
             i = dataframe.index[-1]
             logger.info(
                 f"[ML-LONG] {pair} "
@@ -475,7 +484,19 @@ class SmallCapMLStrategy(IStrategy):
         dataframe.loc[short_rsi_exhaustion, 'enter_short'] = 1
         dataframe.loc[short_rsi_exhaustion, 'enter_tag'] = 'ml_rsi_exhaustion_short'
 
-        if short_exhaustion.iloc[-1] or short_rsi_exhaustion.iloc[-1]:
+        # Type C: 纯趋势入场 (ML看跌 + EMA空头, 不需要耗尽形态)
+        short_trend = (
+            ml_short &
+            (dataframe['ema_12'] < dataframe['ema_26']) &
+            (dataframe['close'] < dataframe['ema_12'] * 1.005) &
+            adx_ok &
+            (dataframe['btc_bullish'] == 0) &
+            ~short_exhaustion & ~short_rsi_exhaustion
+        )
+        dataframe.loc[short_trend, 'enter_short'] = 1
+        dataframe.loc[short_trend, 'enter_tag'] = 'ml_trend_short'
+
+        if short_exhaustion.iloc[-1] or short_rsi_exhaustion.iloc[-1] or short_trend.iloc[-1]:
             i = dataframe.index[-1]
             logger.info(
                 f"[ML-SHORT] {pair} "
