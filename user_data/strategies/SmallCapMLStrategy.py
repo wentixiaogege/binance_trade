@@ -143,8 +143,8 @@ class SmallCapMLStrategy(IStrategy):
     }
 
     # === 入场阈值 ===
-    ml_long_threshold = DecimalParameter(0.0005, 0.010, default=0.002, space='buy')
-    ml_short_threshold = DecimalParameter(-0.010, -0.0005, default=-0.002, space='buy')
+    ml_long_threshold = DecimalParameter(0.002, 0.015, default=0.005, space='buy')
+    ml_short_threshold = DecimalParameter(-0.015, -0.002, default=-0.005, space='buy')
     rsi_dip_max = IntParameter(25, 45, default=35, space='buy')
     rsi_bounce_min = IntParameter(55, 75, default=65, space='buy')
 
@@ -397,8 +397,9 @@ class SmallCapMLStrategy(IStrategy):
             else:
                 del self._pair_jail_until[pair]
 
-        # ML 预测
-        pred_col = '&-s_target'  # FreqAI 回归器默认预测列名
+        # ML 预测 + 置信度过滤
+        pred_col = '&-s_target'
+        do_predict_col = 'do_predict'
         if pred_col not in dataframe.columns:
             logger.warning(f"[ML] {pair}: no prediction column '{pred_col}' in dataframe")
             return dataframe
@@ -406,11 +407,17 @@ class SmallCapMLStrategy(IStrategy):
         prediction = dataframe[pred_col]
         pred_mean = prediction.rolling(5).mean()
 
+        # FreqAI 置信度: do_predict=1 表示预测可信 (DI < threshold)
+        if do_predict_col in dataframe.columns:
+            ml_confident = dataframe[do_predict_col].astype(bool)
+        else:
+            ml_confident = True  # 回测兼容
+
         # ═══════════════════════════════════════════════════════
-        # 做多: ML看涨 + 回调下跌耗尽 → 入场做多
+        # 做多: ML看涨 + 置信度高 + 回调下跌耗尽 → 入场做多
         # ═══════════════════════════════════════════════════════
 
-        ml_long = pred_mean > self.ml_long_threshold.value
+        ml_long = (pred_mean > self.ml_long_threshold.value) & ml_confident
         adx_ok = dataframe['adx'] > 15
 
         # Type A: 回调耗尽入场
@@ -434,19 +441,8 @@ class SmallCapMLStrategy(IStrategy):
         dataframe.loc[long_rsi_exhaustion, 'enter_long'] = 1
         dataframe.loc[long_rsi_exhaustion, 'enter_tag'] = 'ml_rsi_exhaustion_long'
 
-        # Type C: 纯趋势入场 (ML看涨 + EMA多头, 不需要耗尽形态)
-        long_trend = (
-            ml_long &
-            (dataframe['ema_12'] > dataframe['ema_26']) &
-            (dataframe['close'] > dataframe['ema_12'] * 0.995) &
-            adx_ok &
-            ~long_exhaustion & ~long_rsi_exhaustion
-        )
-        dataframe.loc[long_trend, 'enter_long'] = 1
-        dataframe.loc[long_trend, 'enter_tag'] = 'ml_trend_long'
-
         # 日志
-        if long_exhaustion.iloc[-1] or long_rsi_exhaustion.iloc[-1] or long_trend.iloc[-1]:
+        if long_exhaustion.iloc[-1] or long_rsi_exhaustion.iloc[-1]:
             i = dataframe.index[-1]
             logger.info(
                 f"[ML-LONG] {pair} "
@@ -456,10 +452,10 @@ class SmallCapMLStrategy(IStrategy):
             )
 
         # ═══════════════════════════════════════════════════════
-        # 做空: ML看跌 + 反弹上涨耗尽 → 入场做空
+        # 做空: ML看跌 + 置信度高 + 反弹上涨耗尽 → 入场做空
         # ═══════════════════════════════════════════════════════
 
-        ml_short = pred_mean < self.ml_short_threshold.value
+        ml_short = (pred_mean < self.ml_short_threshold.value) & ml_confident
 
         # Type A: 反弹耗尽入场
         # ML预测跌 + 连续阳线后阴线反转 + 放量 = 买压耗尽，顺势做空
@@ -484,19 +480,7 @@ class SmallCapMLStrategy(IStrategy):
         dataframe.loc[short_rsi_exhaustion, 'enter_short'] = 1
         dataframe.loc[short_rsi_exhaustion, 'enter_tag'] = 'ml_rsi_exhaustion_short'
 
-        # Type C: 纯趋势入场 (ML看跌 + EMA空头, 不需要耗尽形态)
-        short_trend = (
-            ml_short &
-            (dataframe['ema_12'] < dataframe['ema_26']) &
-            (dataframe['close'] < dataframe['ema_12'] * 1.005) &
-            adx_ok &
-            (dataframe['btc_bullish'] == 0) &
-            ~short_exhaustion & ~short_rsi_exhaustion
-        )
-        dataframe.loc[short_trend, 'enter_short'] = 1
-        dataframe.loc[short_trend, 'enter_tag'] = 'ml_trend_short'
-
-        if short_exhaustion.iloc[-1] or short_rsi_exhaustion.iloc[-1] or short_trend.iloc[-1]:
+        if short_exhaustion.iloc[-1] or short_rsi_exhaustion.iloc[-1]:
             i = dataframe.index[-1]
             logger.info(
                 f"[ML-SHORT] {pair} "
